@@ -12,9 +12,7 @@ Baixe o APK estável nas **[Releases](https://github.com/paulomafraa/AgendAI/rel
 
 > No Android, pode ser necessário permitir a instalação de apps de fontes desconhecidas.
 
-## Uso r
-á
-pido
+## Uso rápido
 
 1. Instale o APK da Release  
 2. Em **Ajustes**, cole sua chave de IA (Gemini recomendado)  
@@ -22,9 +20,7 @@ pido
 
 Google (opcional): **Continuar com o Google** em Ajustes.
 
-## Licen
-ç
-a
+## Licença
 
 Código e app com **todos os direitos reservados** — veja [LICENSE](LICENSE).  
 O repositório é público para transparência e distribuição do APK; **não** é open source.
