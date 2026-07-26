@@ -1,0 +1,155 @@
+{
+  "expo": {
+    "name": "AgendAI",
+    "slug": "agendai",
+    "version": "1.0.11",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "agendai",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#F3F6F8"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.agendai.app",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "O AgendAI usa o microfone para transformar sua fala em tarefas e lembretes.",
+        "NSSpeechRecognitionUsageDescription": "O AgendAI usa reconhecimento de fala para entender o que voce pediu."
+      }
+    },
+    "android": {
+      "package": "com.agendai.app",
+      "versionCode": 15,
+      "softwareKeyboardLayoutMode": "resize",
+      "adaptiveIcon": {
+        "backgroundColor": "#CCFBF1",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.USE_EXACT_ALARM",
+        "android.permission.USE_FULL_SCREEN_INTENT",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.VIBRATE",
+        "android.permission.WAKE_LOCK"
+      ],
+      "predictiveBackGestureEnabled": false,
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": false,
+          "data": [
+            {
+              "scheme": "agendai",
+              "host": "voice"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-dev-client",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "O AgendAI usa o microfone para transformar sua fala em tarefas e lembretes.",
+          "speechRecognitionPermission": "O AgendAI usa reconhecimento de fala para entender o que voce pediu.",
+          "androidSpeechServicePackages": [
+            "com.google.android.googlequicksearchbox"
+          ]
+        }
+      ],
+      "expo-secure-store",
+      "expo-font",
+      "expo-web-browser",
+      "@react-native-google-signin/google-signin",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/android-icon-monochrome.png",
+          "color": "#0F766E",
+          "defaultChannel": "agendai-alarms-v3-chime",
+          "sounds": [
+            "./assets/sounds/chime.wav",
+            "./assets/sounds/alert.wav"
+          ]
+        }
+      ],
+      "expo-quick-actions",
+      [
+        "react-native-android-widget",
+        {
+          "widgets": [
+            {
+              "name": "AgendaiTasks",
+              "label": "AgendAI · Tarefas",
+              "description": "Lista rápida das tarefas abertas",
+              "minWidth": "110dp",
+              "minHeight": "180dp",
+              "maxResizeWidth": "110dp",
+              "maxResizeHeight": "180dp",
+              "targetCellWidth": 2,
+              "targetCellHeight": 3,
+              "previewImage": "./assets/widget-preview/tasks.png",
+              "resizeMode": "none",
+              "updatePeriodMillis": 1800000
+            },
+            {
+              "name": "AgendaiEvents",
+              "label": "AgendAI · Agenda",
+              "description": "Próximos compromissos",
+              "minWidth": "250dp",
+              "minHeight": "110dp",
+              "maxResizeWidth": "250dp",
+              "maxResizeHeight": "110dp",
+              "targetCellWidth": 4,
+              "targetCellHeight": 2,
+              "previewImage": "./assets/widget-preview/events.png",
+              "resizeMode": "none",
+              "updatePeriodMillis": 1800000
+            },
+            {
+              "name": "AgendaiHome",
+              "label": "AgendAI · Tarefas e Agenda",
+              "description": "Tarefas e compromissos lado a lado",
+              "minWidth": "250dp",
+              "minHeight": "140dp",
+              "maxResizeWidth": "250dp",
+              "maxResizeHeight": "140dp",
+              "targetCellWidth": 4,
+              "targetCellHeight": 2,
+              "previewImage": "./assets/widget-preview/home.png",
+              "resizeMode": "none",
+              "updatePeriodMillis": 1800000
+            }
+          ]
+        }
+      ]
+    ],
+    "extra": {
+      "googleOAuth": {
+        "webClientId": "",
+        "androidClientId": "",
+        "iosClientId": ""
+      },
+      "eas": {
+        "projectId": "339dcce4-6581-44bc-b278-3077956eec9c"
+      }
+    },
+    "owner": "paulomafras-team"
+  }
+}
