@@ -8,7 +8,7 @@ Stack: **Expo SDK 54** · **React Native** · **TypeScript**.
 
 ## Releases
 
-Baixe o APK estável nas **[Releases](https://github.com/paulomw/AgendAI/releases)** do GitHub.
+Baixe o APK estável nas **[Releases](https://github.com/paulomafraa/AgendAI/releases)** do GitHub.
 
 > No Android, pode ser necessário permitir a instalação de apps de fontes desconhecidas.
 
