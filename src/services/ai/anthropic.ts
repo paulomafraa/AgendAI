@@ -20,8 +20,9 @@ const ANTHROPIC_MODELS = [
 export async function parseWithAnthropic(
   rawInput: string,
   apiKey: string,
+  openTaskTitles: string[] = [],
 ): Promise<ParsedBatch> {
-  const prompt = buildIntentPrompt(rawInput);
+  const prompt = buildIntentPrompt(rawInput, openTaskTitles);
   let lastError = '';
 
   for (const model of ANTHROPIC_MODELS) {

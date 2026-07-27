@@ -16,8 +16,9 @@ const OPENAI_MODELS = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4o'];
 export async function parseWithOpenAI(
   rawInput: string,
   apiKey: string,
+  openTaskTitles: string[] = [],
 ): Promise<ParsedBatch> {
-  const prompt = buildIntentPrompt(rawInput);
+  const prompt = buildIntentPrompt(rawInput, openTaskTitles);
   let lastError = '';
 
   for (const model of OPENAI_MODELS) {

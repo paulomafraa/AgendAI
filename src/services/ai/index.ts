@@ -13,6 +13,7 @@ export { detectProvider, providerLabel } from './shared';
 export async function parseUserIntent(
   rawInput: string,
   apiKey: string,
+  openTaskTitles: string[] = [],
 ): Promise<ParsedBatch> {
   if (!apiKey.trim()) {
     throw new Error(
@@ -25,14 +26,19 @@ export async function parseUserIntent(
     throw new Error('Pedido vazio.');
   }
 
+  const safeTitles = openTaskTitles
+    .map((t) => clampText(t, 120))
+    .filter(Boolean)
+    .slice(0, 40);
+
   const provider = detectProvider(apiKey);
   switch (provider) {
     case 'openai':
-      return parseWithOpenAI(safeInput, apiKey);
+      return parseWithOpenAI(safeInput, apiKey, safeTitles);
     case 'anthropic':
-      return parseWithAnthropic(safeInput, apiKey);
+      return parseWithAnthropic(safeInput, apiKey, safeTitles);
     case 'gemini':
     default:
-      return parseWithGemini(safeInput, apiKey);
+      return parseWithGemini(safeInput, apiKey, safeTitles);
   }
 }

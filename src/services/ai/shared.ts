@@ -69,7 +69,9 @@ Regras de quebra (obrigatórias):
   · reminderSeries com fromHour, toHour, intervalMinutes, dayKey, untilDone true
   · title curto; notes pode explicar a série
 - "prazo da tarefa X para sexta" → set_task_due.
-- "já fiz X" / "risca X" → complete_task (cancela a série de lembretes).
+- "já fiz X" / "risca X" / "já troquei as matérias" → complete_task (cancela a série de lembretes).
+  · Em complete_task / delete_task / set_task_due, o campo title deve ser CURTO e o mais próximo possível de uma tarefa aberta listada abaixo (copie o título dela se bater).
+  · Poucas palavras bastam ("matérias", "já fiz as matérias") — não invente título longo que não exista na lista.
 - "apaga X" → delete_task.
 - "adiar X para quinta às 15" / "remarcar dentista" → reschedule_event (timeExplicit true, softTime false).
 - "evento o dia todo amanhã" / "feriado sexta" → create_event allDay true (não usa softTime 13h).
@@ -103,12 +105,22 @@ function formatNowLocalPtBr(date: Date): string {
   return `${full} (${weekday}, America/Sao_Paulo)`;
 }
 
-export function buildIntentPrompt(rawInput: string): string {
+export function buildIntentPrompt(
+  rawInput: string,
+  openTaskTitles: string[] = [],
+): string {
   const now = new Date();
+  const taskBlock =
+    openTaskTitles.length > 0
+      ? `\n\nTarefas abertas agora (para complete_task / delete_task / set_task_due, prefira copiar o título mais próximo):\n${openTaskTitles
+          .slice(0, 40)
+          .map((t) => `- ${t}`)
+          .join('\n')}`
+      : '\n\nTarefas abertas agora: (nenhuma)';
   return `${INTENT_SYSTEM_PROMPT.replace('{{NOW}}', now.toISOString()).replace(
     '{{NOW_LOCAL}}',
     formatNowLocalPtBr(now),
-  )}\n\nPedido do usuário:\n"""${rawInput}"""`;
+  )}${taskBlock}\n\nPedido do usuário:\n"""${rawInput}"""`;
 }
 
 export function detectProvider(apiKey: string): AiProviderId {
