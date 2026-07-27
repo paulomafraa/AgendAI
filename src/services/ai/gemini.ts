@@ -135,8 +135,9 @@ function isRetryableModelError(message: string): boolean {
 export async function parseWithGemini(
   rawInput: string,
   apiKey: string,
+  openTaskTitles: string[] = [],
 ): Promise<ParsedBatch> {
-  const basePrompt = buildIntentPrompt(rawInput);
+  const basePrompt = buildIntentPrompt(rawInput, openTaskTitles);
   const publicLookup = looksLikePublicLookupIntent(rawInput);
   let models: string[] = [];
   try {

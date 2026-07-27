@@ -60,6 +60,7 @@ import {
   needsSoftTimePrompt,
   todayKeySaoPaulo,
 } from '../utils/eventTime';
+import { findMatchingTodo } from '../utils/matchTodo';
 import { UNDO_WINDOW_MS } from '../constants/undo';
 import type {
   AppSettings,
@@ -347,13 +348,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (item.action === 'set_task_due') {
-        const needle = item.title.toLowerCase();
-        const match = currentTodos.find(
-          (t) =>
-            !t.done &&
-            (t.title.toLowerCase().includes(needle) ||
-              needle.includes(t.title.toLowerCase())),
-        );
+        const match =
+          findMatchingTodo(item.title, currentTodos) ??
+          findMatchingTodo(rawInput, currentTodos);
         if (!match || !item.dueDate) {
           return {
             detail: 'Nenhuma tarefa para definir prazo',
@@ -380,13 +377,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (item.action === 'complete_task') {
-        const needle = item.title.toLowerCase();
-        const match = currentTodos.find(
-          (t) =>
-            !t.done &&
-            (t.title.toLowerCase().includes(needle) ||
-              needle.includes(t.title.toLowerCase())),
-        );
+        const match =
+          findMatchingTodo(item.title, currentTodos) ??
+          findMatchingTodo(rawInput, currentTodos);
         if (!match) {
           return {
             detail: 'Nenhuma tarefa correspondente',
@@ -413,12 +406,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (item.action === 'delete_task') {
-        const needle = item.title.toLowerCase();
-        const match = currentTodos.find(
-          (t) =>
-            t.title.toLowerCase().includes(needle) ||
-            needle.includes(t.title.toLowerCase()),
-        );
+        const match =
+          findMatchingTodo(item.title, currentTodos, { includeDone: true }) ??
+          findMatchingTodo(rawInput, currentTodos, { includeDone: true });
         if (!match) {
           return {
             detail: 'Nenhuma tarefa para apagar',
@@ -785,7 +775,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
       try {
-        const batch = await parseUserIntent(trimmed, settings.aiApiKey);
+        const openTitles = todos.filter((t) => !t.done).map((t) => t.title);
+        const batch = await parseUserIntent(
+          trimmed,
+          settings.aiApiKey,
+          openTitles,
+        );
         const onlyList =
           batch.items.length > 0 &&
           batch.items.every((i) => i.action === 'list_tasks');
@@ -814,6 +809,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       enqueueInput,
       settings.aiApiKey,
       settings.confirmBeforeSave,
+      todos,
     ],
   );
 
@@ -831,7 +827,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setBusy(true);
       setError(null);
       try {
-        const batch = await parseUserIntent(head.text, settings.aiApiKey);
+        const openTitles = todos.filter((t) => !t.done).map((t) => t.title);
+        const batch = await parseUserIntent(
+          head.text,
+          settings.aiApiKey,
+          openTitles,
+        );
         await applyBatch(batch, head.source);
         setInputQueue(() => {
           void saveInputQueue(rest);
@@ -859,7 +860,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     } finally {
       drainingQueueRef.current = false;
     }
-  }, [applyBatch, busy, inputQueue, settings.aiApiKey]);
+  }, [applyBatch, busy, inputQueue, settings.aiApiKey, todos]);
 
   useEffect(() => {
     if (!ready) return;
