@@ -19,6 +19,7 @@ const KEYS = {
   history: '@agendai/history',
   settings: '@agendai/settings',
   inputQueue: '@agendai/input_queue',
+  dismissedGoogleEvents: '@agendai/dismissed_google_events',
   aiKey: 'agendai_ai_api_key',
   geminiKey: 'agendai_gemini_api_key',
   googleClientId: 'agendai_google_web_client_id',
@@ -206,6 +207,27 @@ export async function saveInputQueue(queue: QueuedInput[]): Promise<void> {
   await AsyncStorage.setItem(
     KEYS.inputQueue,
     JSON.stringify(queue.slice(0, LIMITS.queueSize)),
+  );
+}
+
+/** IDs do Calendar que o usuário removeu só no app (não reimportar). */
+export async function loadDismissedGoogleEventIds(): Promise<string[]> {
+  const raw = await readJson<unknown>(KEYS.dismissedGoogleEvents, []);
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((id): id is string => typeof id === 'string')
+    .map((id) => clampText(id, 120))
+    .filter(Boolean)
+    .slice(0, LIMITS.dismissedGoogleEvents);
+}
+
+export async function saveDismissedGoogleEventIds(
+  ids: string[],
+): Promise<void> {
+  const unique = [...new Set(ids.map((id) => clampText(id, 120)).filter(Boolean))];
+  await AsyncStorage.setItem(
+    KEYS.dismissedGoogleEvents,
+    JSON.stringify(unique.slice(0, LIMITS.dismissedGoogleEvents)),
   );
 }
 

@@ -131,6 +131,7 @@ function EventRow({
   const hasExtra = Boolean(
     item.notes?.trim() || item.location || item.broadcastStartAt,
   );
+  const synced = Boolean(item.googleEventId);
 
   return (
     <View style={[styles.row, past && styles.rowPast]}>
@@ -139,6 +140,9 @@ function EventRow({
         <Text style={[styles.when, past && styles.whenPast]}>
           {past ? `Passado · ${formatWhen(item)}` : formatWhen(item)}
         </Text>
+        {synced ? (
+          <Text style={styles.syncHint}>Na Agenda Google · Apagar só tira do app</Text>
+        ) : null}
         {hasExtra ? (
           <Text style={styles.expandHint}>Toque para detalhes</Text>
         ) : null}
@@ -152,10 +156,18 @@ function EventRow({
 
 export function EventsScreen() {
   const insets = useSafeAreaInsets();
-  const { events, deleteEvent, syncEventsFromGoogle } = useApp();
+  const {
+    events,
+    deleteEvent,
+    syncEventsFromGoogle,
+    syncAgendaWithGoogle,
+    settings,
+    lastSyncNote,
+  } = useApp();
   const [filter, setFilter] = useState<EventFilter>('all');
   const [sort, setSort] = useState<EventSort>('soonest');
   const [selected, setSelected] = useState<CalendarEventItem | null>(null);
+  const [syncBusy, setSyncBusy] = useState(false);
   const nowMs = useNowTick(20_000);
 
   const list = useMemo(
@@ -169,22 +181,44 @@ export function EventsScreen() {
     }, [syncEventsFromGoogle]),
   );
 
+  const onSync = async () => {
+    if (!settings.googleConnected || syncBusy) return;
+    setSyncBusy(true);
+    try {
+      await syncAgendaWithGoogle();
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
   return (
     <View style={[styles.root, { paddingTop: Math.max(insets.top, 16) + 12 }]}>
       <View style={styles.headerRow}>
         <Text style={styles.heading}>Eventos</Text>
-        <OrganizeSheet
-          triggerLabel="Organizar"
-          title="Mostrar"
-          options={FILTERS}
-          value={filter}
-          onChange={setFilter}
-          secondaryTitle="Ordenar"
-          secondaryOptions={SORTS}
-          secondaryValue={sort}
-          onSecondaryChange={(id) => setSort(id as EventSort)}
-        />
+        <View style={styles.headerActions}>
+          {settings.googleConnected ? (
+            <Pressable onPress={() => void onSync()} hitSlop={8}>
+              <Text style={styles.syncBtn}>
+                {syncBusy ? 'Sincronizando…' : 'Sincronizar'}
+              </Text>
+            </Pressable>
+          ) : null}
+          <OrganizeSheet
+            triggerLabel="Organizar"
+            title="Mostrar"
+            options={FILTERS}
+            value={filter}
+            onChange={setFilter}
+            secondaryTitle="Ordenar"
+            secondaryOptions={SORTS}
+            secondaryValue={sort}
+            onSecondaryChange={(id) => setSort(id as EventSort)}
+          />
+        </View>
       </View>
+      {lastSyncNote ? (
+        <Text style={styles.syncNote}>{lastSyncNote}</Text>
+      ) : null}
 
       <FlatList
         data={list}
@@ -230,6 +264,24 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingHorizontal: 24,
     marginBottom: 12,
+  },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+  },
+  syncBtn: {
+    fontFamily: 'DMSans_500Medium',
+    fontSize: 14,
+    color: colors.accent,
+  },
+  syncNote: {
+    fontFamily: 'DMSans_400Regular',
+    fontSize: 13,
+    color: colors.accent,
+    paddingHorizontal: 24,
+    marginBottom: 8,
+    lineHeight: 18,
   },
   heading: {
     fontFamily: 'Fraunces_700Bold',
@@ -284,6 +336,11 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   mutedText: {
+    color: colors.inkMuted,
+  },
+  syncHint: {
+    fontFamily: 'DMSans_400Regular',
+    fontSize: 12,
     color: colors.inkMuted,
   },
   expandHint: {

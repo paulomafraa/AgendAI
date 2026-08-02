@@ -46,7 +46,8 @@ export function SettingsScreen() {
   const inputRef = useRef<TextInput>(null);
   const scrollRef = useRef<ScrollView>(null);
   const scrollYRef = useRef(0);
-  const { settings, updateSettings, refreshGoogleStatus } = useApp();
+  const { settings, updateSettings, refreshGoogleStatus, syncAgendaWithGoogle } =
+    useApp();
   const [keyDraft, setKeyDraft] = useState(settings.aiApiKey);
   const [clientIdDraft, setClientIdDraft] = useState(settings.googleWebClientId);
   const [googleMsg, setGoogleMsg] = useState<string | null>(null);
@@ -489,12 +490,17 @@ export function SettingsScreen() {
                 <Text style={styles.okHint}>
                   Conectado{googleEmail ? ` · ${googleEmail}` : ''}
                 </Text>
+                <Text style={styles.hint}>
+                  Os compromissos do app vão para a Agenda Google. Apagar no app
+                  tira só daqui (a Agenda fica). Para sumir dos dois, apague no
+                  Calendar e sincronize. Sem Google, o app funciona sozinho.
+                </Text>
                 <View style={styles.row}>
                   <View style={styles.rowText}>
                     <Text style={styles.label}>Sincronizar ao salvar</Text>
                     <Text style={styles.hint}>
                       Envia novos itens para Agenda e Tasks. Desligado: fica só
-                      no aparelho.
+                      no aparelho até você sincronizar.
                     </Text>
                   </View>
                   <Switch
@@ -504,6 +510,24 @@ export function SettingsScreen() {
                     thumbColor="#fff"
                   />
                 </View>
+                <Pressable
+                  style={styles.btn}
+                  onPress={() => {
+                    setGoogleBusy(true);
+                    void (async () => {
+                      try {
+                        await syncAgendaWithGoogle();
+                      } finally {
+                        setGoogleBusy(false);
+                      }
+                    })();
+                  }}
+                  disabled={googleBusy}
+                >
+                  <Text style={styles.btnText}>
+                    {googleBusy ? 'Sincronizando…' : 'Sincronizar agenda'}
+                  </Text>
+                </Pressable>
                 <Pressable
                   style={styles.btnSecondary}
                   onPress={onGoogleDisconnect}
