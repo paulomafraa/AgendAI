@@ -170,7 +170,9 @@ export async function parseWithGemini(
 CORREÇÃO OBRIGATÓRIA (o resultado anterior estava inválido):
 - Agora é ${nowForFix.toISOString()}. O datetime NÃO pode ser no passado.
 - Para "próximo jogo/corrida", escolha o PRÓXIMO evento FUTURO.
-- Se a busca mostrar horário (ex.: 19:00), use ESSA hora: timeExplicit true, softTime false.
+- FUSO: datetime SEMPRE em horário de Brasília (offset -03:00). NUNCA use hora local do circuito/país (CEST, ET, BST…).
+- Se a busca tiver "10h Brasília (15h local)", o datetime deve ser 10:00-03:00.
+- Se a busca mostrar horário confiável: timeExplicit true, softTime false.
 - softTime 13:00 é proibido quando existe HH:MM na busca.
 - Refaça a busca se precisar. Responda só o JSON corrigido.`;
 

@@ -1016,11 +1016,11 @@ export type GoogleCalendarRemoteEvent = {
 };
 
 /**
- * Busca eventos próximos na Agenda Google (próximos 30 dias).
+ * Busca eventos na Agenda Google (14 dias atrás até 60 dias à frente).
  * Inclui eventos com horário e all-day.
  */
 export async function fetchGoogleCalendarEvents(): Promise<
-  | { ok: true; items: GoogleCalendarRemoteEvent[] }
+  | { ok: true; items: GoogleCalendarRemoteEvent[]; windowStartMs: number; windowEndMs: number }
   | { ok: false; message: string }
 > {
   try {
@@ -1028,16 +1028,16 @@ export async function fetchGoogleCalendarEvents(): Promise<
     if (!accessToken) {
       return { ok: false, message: 'Google não conectado.' };
     }
-    const timeMin = new Date().toISOString();
-    const timeMax = new Date(
-      Date.now() + 30 * 24 * 60 * 60 * 1000,
-    ).toISOString();
+    const windowStartMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const windowEndMs = Date.now() + 60 * 24 * 60 * 60 * 1000;
+    const timeMin = new Date(windowStartMs).toISOString();
+    const timeMax = new Date(windowEndMs).toISOString();
     const params = new URLSearchParams({
       timeMin,
       timeMax,
       singleEvents: 'true',
       orderBy: 'startTime',
-      maxResults: '50',
+      maxResults: '100',
     });
     const res = await fetch(
       `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
@@ -1095,7 +1095,7 @@ export async function fetchGoogleCalendarEvents(): Promise<
         reminderMinutes: reminderMinutes ?? 30,
       });
     }
-    return { ok: true, items };
+    return { ok: true, items, windowStartMs, windowEndMs };
   } catch (e) {
     return {
       ok: false,
@@ -1106,21 +1106,62 @@ export async function fetchGoogleCalendarEvents(): Promise<
 }
 
 /**
- * Atualiza eventos locais que já têm googleEventId e importa novos remotos.
- * Não apaga eventos só locais.
+ * Merge Agenda Google → app.
+ * - Agenda é fonte da verdade para eventos já ligados (googleEventId).
+ * - Se sumiu no Calendar, remove do app.
+ * - Importa eventos novos do Calendar.
+ * - Mantém eventos só locais (sem googleEventId) — nunca apaga nada no Google.
+ * - Nunca sobrescreve o Calendar a partir do app.
  */
 export function mergeGoogleCalendarEvents(
   local: CalendarEventItem[],
   remote: GoogleCalendarRemoteEvent[],
-): { events: CalendarEventItem[]; changed: number } {
+  opts?: {
+    windowStartMs?: number;
+    windowEndMs?: number;
+    /** Eventos que o usuário apagou só no app — não reimportar do Calendar. */
+    dismissedGoogleEventIds?: string[];
+  },
+): {
+  events: CalendarEventItem[];
+  changed: number;
+  removed: CalendarEventItem[];
+  /** IDs que sumiram do Calendar e podem sair da lista de dispensados. */
+  clearedDismissedIds: string[];
+} {
   const byRemoteId = new Map(remote.map((r) => [r.googleEventId, r]));
+  const dismissed = new Set(opts?.dismissedGoogleEventIds ?? []);
   let changed = 0;
   const seen = new Set<string>();
+  const removed: CalendarEventItem[] = [];
+  const kept: CalendarEventItem[] = [];
+  const clearedDismissedIds: string[] = [];
+  const windowStartMs =
+    opts?.windowStartMs ?? Date.now() - 14 * 24 * 60 * 60 * 1000;
+  const windowEndMs =
+    opts?.windowEndMs ?? Date.now() + 60 * 24 * 60 * 60 * 1000;
 
-  const updated = local.map((ev) => {
-    if (!ev.googleEventId) return ev;
+  for (const ev of local) {
+    if (!ev.googleEventId) {
+      kept.push(ev);
+      continue;
+    }
     const rem = byRemoteId.get(ev.googleEventId);
-    if (!rem) return ev;
+    if (!rem) {
+      const startMs = new Date(ev.startAt).getTime();
+      // Só remove se estiver na janela buscada — fora dela a ausência não prova exclusão.
+      const inWindow = startMs >= windowStartMs && startMs <= windowEndMs;
+      if (inWindow) {
+        changed += 1;
+        removed.push(ev);
+        if (dismissed.has(ev.googleEventId)) {
+          clearedDismissedIds.push(ev.googleEventId);
+        }
+      } else {
+        kept.push(ev);
+      }
+      continue;
+    }
     seen.add(ev.googleEventId);
     if (
       ev.title === rem.title &&
@@ -1130,10 +1171,11 @@ export function mergeGoogleCalendarEvents(
       (ev.location ?? '') === (rem.location ?? '') &&
       Boolean(ev.allDay) === Boolean(rem.allDay)
     ) {
-      return ev;
+      kept.push(ev);
+      continue;
     }
     changed += 1;
-    return {
+    kept.push({
       ...ev,
       title: rem.title,
       notes: rem.notes,
@@ -1143,13 +1185,14 @@ export function mergeGoogleCalendarEvents(
       endAt: rem.endAt,
       wantsReminder: rem.wantsReminder,
       reminderMinutes: rem.reminderMinutes ?? ev.reminderMinutes,
-    };
-  });
+    });
+  }
 
   const imports: CalendarEventItem[] = [];
   for (const rem of remote) {
     if (seen.has(rem.googleEventId)) continue;
     if (local.some((e) => e.googleEventId === rem.googleEventId)) continue;
+    if (dismissed.has(rem.googleEventId)) continue;
     changed += 1;
     imports.push({
       id: `gcal-${rem.googleEventId}`,
@@ -1168,7 +1211,7 @@ export function mergeGoogleCalendarEvents(
     });
   }
 
-  return { events: [...imports, ...updated], changed };
+  return { events: [...imports, ...kept], changed, removed, clearedDismissedIds };
 }
 
 function formatGoogleHttpError(

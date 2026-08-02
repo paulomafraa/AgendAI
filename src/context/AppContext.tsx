@@ -11,7 +11,6 @@ import { AppState, type AppStateStatus } from 'react-native';
 import { parseUserIntent } from '../services/ai';
 import {
   completeTaskOnGoogle,
-  deleteEventOnGoogle,
   deleteTaskOnGoogle,
   fetchGoogleCalendarEvents,
   fetchGoogleTaskStatuses,
@@ -20,7 +19,6 @@ import {
   mergeGoogleTaskStatuses,
   pushEventToGoogle,
   pushTaskToGoogle,
-  updateEventOnGoogle,
   updateTaskOnGoogle,
 } from '../services/google';
 import {
@@ -39,11 +37,13 @@ import {
   loadEvents,
   loadHistory,
   loadInputQueue,
+  loadDismissedGoogleEventIds,
   loadSettings,
   loadTodos,
   saveEvents,
   saveHistory,
   saveInputQueue,
+  saveDismissedGoogleEventIds,
   saveSettings,
   saveTodos,
 } from '../services/storage';
@@ -91,6 +91,7 @@ type AppContextValue = {
   error: string | null;
   lastSyncNote: string | null;
   queuedCount: number;
+  queueProcessing: boolean;
   clearError: () => void;
   updateSettings: (patch: Partial<AppSettings>) => Promise<void>;
   submitInput: (text: string, source: InputSource) => Promise<void>;
@@ -103,6 +104,8 @@ type AppContextValue = {
   refreshGoogleStatus: () => Promise<void>;
   syncTasksFromGoogle: () => Promise<void>;
   syncEventsFromGoogle: () => Promise<void>;
+  /** Envia eventos locais → Agenda e puxa Calendar (apaga no app só o que sumiu no Google). */
+  syncAgendaWithGoogle: () => Promise<void>;
   undoSnapshot: UndoSnapshot | null;
   undoLastChange: () => Promise<void>;
   shareOpenTasks: (category?: string) => Promise<void>;
@@ -135,10 +138,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [lastSyncNote, setLastSyncNote] = useState<string | null>(null);
   const [undoSnapshot, setUndoSnapshot] = useState<UndoSnapshot | null>(null);
   const [inputQueue, setInputQueue] = useState<QueuedInput[]>([]);
+  const inputQueueRef = useRef<QueuedInput[]>([]);
   const drainingQueueRef = useRef(false);
+  const [queueProcessing, setQueueProcessing] = useState(false);
   const [softPromptEvent, setSoftPromptEvent] =
     useState<CalendarEventItem | null>(null);
   const softSnoozeRef = useRef<Set<string>>(new Set());
+  const eventsRef = useRef<CalendarEventItem[]>([]);
+  const softPromptIdRef = useRef<string | null>(null);
+  const dismissedGoogleIdsRef = useRef<string[]>([]);
+  const syncAgendaWithGoogleRef = useRef<
+    ((opts?: { quiet?: boolean }) => Promise<void>) | null
+  >(null);
+
+  useEffect(() => {
+    inputQueueRef.current = inputQueue;
+  }, [inputQueue]);
+
+  useEffect(() => {
+    eventsRef.current = events;
+  }, [events]);
+
+  useEffect(() => {
+    softPromptIdRef.current = softPromptEvent?.id ?? null;
+  }, [softPromptEvent]);
 
   // Feedback curto some sozinho (não fica eterno na tela)
   useEffect(() => {
@@ -184,28 +207,111 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const syncEventsFromGoogle = useCallback(async () => {
-    const tokens = await loadGoogleTokens();
-    if (!tokens?.accessToken) return;
+    await syncAgendaWithGoogleRef.current?.({ quiet: true });
+  }, []);
 
-    const remote = await fetchGoogleCalendarEvents();
-    if (!remote.ok) return;
+  const syncAgendaWithGoogle = useCallback(
+    async (opts?: { quiet?: boolean }) => {
+      const tokens = await loadGoogleTokens();
+      if (!tokens?.accessToken) {
+        if (!opts?.quiet) {
+          setLastSyncNote('Conecte o Google em Ajustes para sincronizar a agenda.');
+        }
+        return;
+      }
 
-    setEvents((prev) => {
-      const { events: next, changed } = mergeGoogleCalendarEvents(
-        prev,
-        remote.items,
-      );
-      if (changed > 0) {
+      // 1) Eventos só do app → sempre vão para a Agenda (nunca apaga no Google)
+      let working = eventsRef.current;
+      let pushed = 0;
+      let pushFail = 0;
+      for (const ev of working.filter((e) => !e.googleEventId)) {
+        const sync = await pushEventToGoogle(ev);
+        if (sync.ok && sync.remoteId) {
+          pushed += 1;
+          working = working.map((e) =>
+            e.id === ev.id ? { ...e, googleEventId: sync.remoteId } : e,
+          );
+        } else {
+          pushFail += 1;
+        }
+      }
+      if (pushed > 0) {
+        setEvents(working);
+        void saveEvents(working);
+      }
+
+      // 2) Puxa Calendar: importa novos, atualiza ligados, remove do app o que sumiu no Google
+      const remote = await fetchGoogleCalendarEvents();
+      if (!remote.ok) {
+        if (!opts?.quiet) {
+          setLastSyncNote(remote.message);
+        }
+        return;
+      }
+
+      const { events: next, changed, removed, clearedDismissedIds } =
+        mergeGoogleCalendarEvents(working, remote.items, {
+          windowStartMs: remote.windowStartMs,
+          windowEndMs: remote.windowEndMs,
+          dismissedGoogleEventIds: dismissedGoogleIdsRef.current,
+        });
+      for (const gone of removed) {
+        await cancelEventLocalNotifications(gone);
+        softSnoozeRef.current.delete(gone.id);
+        if (softPromptIdRef.current === gone.id) setSoftPromptEvent(null);
+      }
+      if (clearedDismissedIds.length > 0) {
+        const clearSet = new Set(clearedDismissedIds);
+        dismissedGoogleIdsRef.current = dismissedGoogleIdsRef.current.filter(
+          (id) => !clearSet.has(id),
+        );
+        void saveDismissedGoogleEventIds(dismissedGoogleIdsRef.current);
+      }
+      if (changed > 0 || pushed > 0) {
+        setEvents(next);
         void saveEvents(next);
-        setLastSyncNote(
-          changed === 1
-            ? '1 evento sincronizado do Google Calendar.'
-            : `${changed} eventos sincronizados do Google Calendar.`,
+      }
+
+      if (opts?.quiet && changed === 0 && pushed === 0) return;
+
+      const parts: string[] = [];
+      if (pushed > 0) {
+        parts.push(
+          pushed === 1
+            ? '1 evento enviado à Agenda'
+            : `${pushed} eventos enviados à Agenda`,
         );
       }
-      return changed > 0 ? next : prev;
-    });
-  }, []);
+      if (removed.length > 0) {
+        parts.push(
+          removed.length === 1
+            ? '1 compromisso removido (apagado no Calendar)'
+            : `${removed.length} compromissos removidos (apagados no Calendar)`,
+        );
+      }
+      const importedOrUpdated = Math.max(0, changed - removed.length);
+      if (importedOrUpdated > 0) {
+        parts.push(
+          importedOrUpdated === 1
+            ? '1 evento atualizado do Calendar'
+            : `${importedOrUpdated} eventos atualizados do Calendar`,
+        );
+      }
+      if (pushFail > 0) {
+        parts.push(
+          pushFail === 1
+            ? '1 evento local não foi enviado'
+            : `${pushFail} eventos locais não foram enviados`,
+        );
+      }
+      setLastSyncNote(
+        parts.length > 0 ? parts.join(' · ') : 'Agenda já estava sincronizada.',
+      );
+    },
+    [],
+  );
+
+  syncAgendaWithGoogleRef.current = syncAgendaWithGoogle;
 
   const syncingRef = useRef(false);
   useEffect(() => {
@@ -227,18 +333,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     (async () => {
-      const [t, e, h, s, q] = await Promise.all([
+      const [t, e, h, s, q, dismissed] = await Promise.all([
         loadTodos(),
         loadEvents(),
         loadHistory(),
         loadSettings(),
         loadInputQueue(),
+        loadDismissedGoogleEventIds(),
       ]);
       const tokens = await loadGoogleTokens();
       setTodos(t);
       setEvents(e);
       setHistory(h);
       setInputQueue(q);
+      dismissedGoogleIdsRef.current = dismissed;
       setSettings({ ...s, googleConnected: Boolean(tokens?.accessToken) });
       setReady(true);
       if (s.notificationsEnabled) {
@@ -593,8 +701,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
         }
         if (shouldSync && updatedEvent.googleEventId) {
-          const sync = await updateEventOnGoogle(updatedEvent);
-          setLastSyncNote(sync.message);
+          // Agenda Google é a fonte: não sobrescreve o Calendar a partir do app.
+          setLastSyncNote(
+            'Remarcado no app. Para refletir na Agenda Google, edite lá ou aguarde a sincronização puxar do Calendar.',
+          );
         }
         return {
           detail: `Remarcado: ${updatedEvent.title} · ${new Date(updatedEvent.startAt).toLocaleString('pt-BR')}`,
@@ -756,111 +866,94 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       void saveInputQueue(next);
       return next;
     });
-    setLastSyncNote('Sem conexão. Pedido na fila; envio quando a internet voltar.');
+    return entry;
   }, []);
 
   const submitInput = useCallback(
-    async (text: string, source: InputSource, opts?: { fromQueue?: boolean }) => {
+    async (text: string, source: InputSource) => {
       const trimmed = text.trim();
       if (!trimmed) return;
       setBusy(true);
       setError(null);
-      if (!opts?.fromQueue) setLastSyncNote(null);
-
-      const online = await isOnline();
-      if (!online) {
-        if (!opts?.fromQueue) await enqueueInput(trimmed, source);
-        setBusy(false);
-        return;
-      }
-
       try {
-        const openTitles = todos.filter((t) => !t.done).map((t) => t.title);
-        const batch = await parseUserIntent(
-          trimmed,
-          settings.aiApiKey,
-          openTitles,
+        await enqueueInput(trimmed, source);
+        const queuedNow = inputQueueRef.current.length;
+        setLastSyncNote(
+          queuedNow > 1
+            ? `Pedido adicionado. Fila com ${queuedNow} itens.`
+            : 'Pedido adicionado à fila.',
         );
-        const onlyList =
-          batch.items.length > 0 &&
-          batch.items.every((i) => i.action === 'list_tasks');
-        if (settings.confirmBeforeSave && !onlyList && !opts?.fromQueue) {
-          setPending({ batch, source });
-        } else {
-          await applyBatch(batch, source);
-          if (opts?.fromQueue) {
-            setLastSyncNote('Pedido da fila processado.');
-          }
-        }
-      } catch (e) {
-        const message =
-          e instanceof Error ? e.message : 'Falha ao processar.';
-        if (!opts?.fromQueue && isLikelyNetworkError(message)) {
-          await enqueueInput(trimmed, source);
-        } else {
-          setError(message);
-        }
       } finally {
         setBusy(false);
       }
+      void drainInputQueue();
     },
-    [
-      applyBatch,
-      enqueueInput,
-      settings.aiApiKey,
-      settings.confirmBeforeSave,
-      todos,
-    ],
+    [enqueueInput],
   );
 
   const drainInputQueue = useCallback(async () => {
-    if (drainingQueueRef.current || busy) return;
-    if (inputQueue.length === 0) return;
-    const online = await isOnline();
-    if (!online) return;
-
+    if (drainingQueueRef.current) return;
+    if (inputQueueRef.current.length === 0) return;
     drainingQueueRef.current = true;
+    setQueueProcessing(true);
     try {
-      const [head, ...rest] = inputQueue;
-      if (!head) return;
-      // Só tira da fila depois de processar com sucesso
-      setBusy(true);
-      setError(null);
-      try {
+      // FIFO real: processa em cadeia até acabar, sem bloquear novo enqueue.
+      while (inputQueueRef.current.length > 0) {
+        const online = await isOnline();
+        if (!online) {
+          setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
+          break;
+        }
+        const head = inputQueueRef.current[0];
+        if (!head) break;
+        setError(null);
         const openTitles = todos.filter((t) => !t.done).map((t) => t.title);
         const batch = await parseUserIntent(
           head.text,
           settings.aiApiKey,
           openTitles,
         );
-        await applyBatch(batch, head.source);
-        setInputQueue(() => {
-          void saveInputQueue(rest);
-          return rest;
-        });
-        setLastSyncNote(
-          rest.length > 0
-            ? `Fila: processado. Ainda restam ${rest.length}.`
-            : 'Pedido da fila processado.',
-        );
-      } catch (e) {
-        const message =
-          e instanceof Error ? e.message : 'Falha ao processar fila.';
-        if (!isLikelyNetworkError(message)) {
-          // Pedido inválido: tira da fila pra não travar
-          setInputQueue(() => {
-            void saveInputQueue(rest);
-            return rest;
-          });
-          setError(message);
+        const onlyList =
+          batch.items.length > 0 &&
+          batch.items.every((i) => i.action === 'list_tasks');
+        if (settings.confirmBeforeSave && !onlyList) {
+          setPending({ batch, source: head.source });
+          setLastSyncNote('Fila pausada aguardando sua confirmação.');
+          break;
         }
-      } finally {
-        setBusy(false);
+        await applyBatch(batch, head.source);
+        setInputQueue((prev) => {
+          if (prev[0]?.id !== head.id) return prev;
+          const next = prev.slice(1);
+          void saveInputQueue(next);
+          return next;
+        });
+        const left = Math.max(0, inputQueueRef.current.length - 1);
+        setLastSyncNote(
+          left > 0
+            ? `Fila: processado. Restam ${left}.`
+            : 'Fila processada.',
+        );
+      }
+    } catch (e) {
+      const message =
+        e instanceof Error ? e.message : 'Falha ao processar fila.';
+      if (isLikelyNetworkError(message)) {
+        setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
+      } else {
+        // Item inválido: remove só o primeiro para destravar.
+        setInputQueue((prev) => {
+          const next = prev.slice(1);
+          void saveInputQueue(next);
+          return next;
+        });
+        setError(message);
       }
     } finally {
       drainingQueueRef.current = false;
+      setQueueProcessing(false);
     }
-  }, [applyBatch, busy, inputQueue, settings.aiApiKey, todos]);
+  }, [applyBatch, settings.aiApiKey, settings.confirmBeforeSave, todos]);
 
   useEffect(() => {
     if (!ready) return;
@@ -868,11 +961,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const stop = onAppBecameActive(() => {
       void drainInputQueue();
     });
+    const appStateSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active' || state === 'background') {
+        void drainInputQueue();
+      }
+    });
     const interval = setInterval(() => {
       void drainInputQueue();
-    }, 20_000);
+    }, 8_000);
     return () => {
       stop();
+      appStateSub.remove();
       clearInterval(interval);
     };
   }, [ready, drainInputQueue]);
@@ -883,12 +982,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       await applyBatch(pending.batch, pending.source);
       setPending(null);
+      setInputQueue((prev) => {
+        if (prev.length === 0) return prev;
+        const next = prev.slice(1);
+        void saveInputQueue(next);
+        return next;
+      });
+      setLastSyncNote('Pedido confirmado e executado.');
     } finally {
       setBusy(false);
     }
-  }, [applyBatch, pending]);
+    void drainInputQueue();
+  }, [applyBatch, pending, drainInputQueue]);
 
-  const cancelPending = useCallback(() => setPending(null), []);
+  const cancelPending = useCallback(() => {
+    setPending(null);
+    setInputQueue((prev) => {
+      if (prev.length === 0) return prev;
+      const next = prev.slice(1);
+      void saveInputQueue(next);
+      return next;
+    });
+    setLastSyncNote('Pedido da fila cancelado.');
+    void drainInputQueue();
+  }, [drainInputQueue]);
 
   const updateSettings = useCallback(
     async (patch: Partial<AppSettings>) => {
@@ -1038,31 +1155,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [settings.googleConnected, settings.syncToGoogle],
   );
 
-  const deleteEvent = useCallback(
-    async (eventId: string) => {
-      let removed: CalendarEventItem | undefined;
-      setEvents((prev) => {
-        removed = prev.find((e) => e.id === eventId);
-        const next = prev.filter((e) => e.id !== eventId);
-        void saveEvents(next);
-        return next;
-      });
-      if (removed) {
-        await cancelEventLocalNotifications(removed);
-        softSnoozeRef.current.delete(eventId);
-        if (softPromptEvent?.id === eventId) setSoftPromptEvent(null);
-        if (
-          settings.googleConnected &&
-          settings.syncToGoogle &&
-          removed.googleEventId
-        ) {
-          const sync = await deleteEventOnGoogle(removed);
-          setLastSyncNote(sync.message);
-        }
+  const deleteEvent = useCallback(async (eventId: string) => {
+    const target = eventsRef.current.find((e) => e.id === eventId);
+    if (!target) return;
+
+    setEvents((prev) => {
+      const next = prev.filter((e) => e.id !== eventId);
+      void saveEvents(next);
+      return next;
+    });
+    await cancelEventLocalNotifications(target);
+    softSnoozeRef.current.delete(eventId);
+    if (softPromptIdRef.current === eventId) setSoftPromptEvent(null);
+
+    // Com Google: remove só do app e não reimporta. A Agenda Google fica intacta.
+    if (target.googleEventId) {
+      if (!dismissedGoogleIdsRef.current.includes(target.googleEventId)) {
+        dismissedGoogleIdsRef.current = [
+          ...dismissedGoogleIdsRef.current,
+          target.googleEventId,
+        ];
+        void saveDismissedGoogleEventIds(dismissedGoogleIdsRef.current);
       }
-    },
-    [settings.googleConnected, settings.syncToGoogle, softPromptEvent],
-  );
+      setLastSyncNote(
+        'Removido do app. Continuou na Agenda Google — apague lá se quiser tirar dos dois.',
+      );
+      return;
+    }
+
+    setLastSyncNote('Evento removido.');
+  }, []);
 
   const scanSoftPrompt = useCallback(() => {
     if (softPromptEvent) return;
@@ -1162,8 +1284,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         settings.syncToGoogle &&
         updated.googleEventId
       ) {
-        const sync = await updateEventOnGoogle(updated);
-        setLastSyncNote(sync.message);
+        // Não sobrescreve o Calendar; a Agenda Google manda na próxima sync.
+        setLastSyncNote(
+          `Remarcado no app para ${String(hour).padStart(2, '0')}:00. Edite no Calendar se quiser manter na Agenda Google.`,
+        );
       } else {
         setLastSyncNote(
           `Remarcado para ${String(hour).padStart(2, '0')}:00.`,
@@ -1197,6 +1321,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       error,
       lastSyncNote,
       queuedCount: inputQueue.length,
+      queueProcessing,
       clearError: () => setError(null),
       updateSettings,
       submitInput,
@@ -1209,6 +1334,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       refreshGoogleStatus,
       syncTasksFromGoogle,
       syncEventsFromGoogle,
+      syncAgendaWithGoogle: () => syncAgendaWithGoogle(),
       undoSnapshot,
       undoLastChange,
       shareOpenTasks,
@@ -1228,6 +1354,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       error,
       lastSyncNote,
       inputQueue.length,
+      queueProcessing,
       updateSettings,
       submitInput,
       confirmPending,
@@ -1239,6 +1366,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       refreshGoogleStatus,
       syncTasksFromGoogle,
       syncEventsFromGoogle,
+      syncAgendaWithGoogle,
       undoSnapshot,
       undoLastChange,
       shareOpenTasks,

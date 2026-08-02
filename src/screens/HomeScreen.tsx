@@ -167,6 +167,7 @@ export function HomeScreen() {
     settings,
     lastSyncNote,
     queuedCount,
+    queueProcessing,
     setTodoDue,
     syncTasksFromGoogle,
     softPromptEvent,
@@ -463,9 +464,13 @@ export function HomeScreen() {
           ) : null}
           {queuedCount > 0 ? (
             <Text style={styles.syncNote}>
-              {queuedCount === 1
-                ? '1 pedido na fila (sem internet)'
-                : `${queuedCount} pedidos na fila (sem internet)`}
+              {queueProcessing
+                ? queuedCount === 1
+                  ? 'Processando fila (1 restante)'
+                  : `Processando fila (${queuedCount} restantes)`
+                : queuedCount === 1
+                  ? '1 pedido aguardando na fila'
+                  : `${queuedCount} pedidos aguardando na fila`}
             </Text>
           ) : null}
           <Pressable

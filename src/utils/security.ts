@@ -10,6 +10,7 @@ export const LIMITS = {
   todos: 500,
   events: 500,
   history: 200,
+  dismissedGoogleEvents: 300,
 } as const;
 
 export function clampText(
