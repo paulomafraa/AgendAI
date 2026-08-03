@@ -710,9 +710,18 @@ export function mergeGoogleTaskStatuses(
       : undefined;
     const nextDueAt = remoteItem.dueAt ?? undefined;
 
+    // Não reabre tarefa concluída no app só porque o Google ainda não refletiu
+    // (ex.: PATCH falhou ou sync chegou antes da conclusão remota).
+    const effectiveDone = todo.done && !nextDone ? true : nextDone;
+    const effectiveCompletedAt = effectiveDone
+      ? nextDone
+        ? nextCompletedAt
+        : todo.completedAt ?? new Date().toISOString()
+      : undefined;
+
     if (
-      todo.done === nextDone &&
-      (todo.completedAt ?? '') === (nextCompletedAt ?? '') &&
+      todo.done === effectiveDone &&
+      (todo.completedAt ?? '') === (effectiveCompletedAt ?? '') &&
       (todo.dueAt ?? '') === (nextDueAt ?? '')
     ) {
       return todo;
@@ -720,8 +729,8 @@ export function mergeGoogleTaskStatuses(
     changed += 1;
     return {
       ...todo,
-      done: nextDone,
-      completedAt: nextCompletedAt,
+      done: effectiveDone,
+      completedAt: effectiveCompletedAt,
       dueAt: nextDueAt,
     };
   });
@@ -1015,6 +1024,76 @@ export type GoogleCalendarRemoteEvent = {
   reminderMinutes?: number;
 };
 
+function normalizeEventTitle(title: string): string {
+  return title
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Considera o mesmo compromisso se título igual e início perto (±3 min) ou ambos all-day no mesmo dia. */
+export function eventsLookSame(
+  a: { title: string; startAt: string; allDay?: boolean },
+  b: { title: string; startAt: string; allDay?: boolean },
+): boolean {
+  if (normalizeEventTitle(a.title) !== normalizeEventTitle(b.title)) return false;
+  if (Boolean(a.allDay) !== Boolean(b.allDay)) return false;
+  if (a.allDay || b.allDay) {
+    return a.startAt.slice(0, 10) === b.startAt.slice(0, 10);
+  }
+  return Math.abs(new Date(a.startAt).getTime() - new Date(b.startAt).getTime()) <= 3 * 60_000;
+}
+
+export function findMatchingRemoteEvent(
+  local: CalendarEventItem,
+  remote: GoogleCalendarRemoteEvent[],
+  usedRemoteIds?: Set<string>,
+): GoogleCalendarRemoteEvent | undefined {
+  return remote.find((r) => {
+    if (usedRemoteIds?.has(r.googleEventId)) return false;
+    return eventsLookSame(local, r);
+  });
+}
+
+/**
+ * Remove cópias locais do mesmo compromisso (mesmo googleEventId ou título+hora).
+ * Prefere o que já tem googleEventId.
+ */
+export function dedupeLocalEvents(events: CalendarEventItem[]): {
+  events: CalendarEventItem[];
+  removed: CalendarEventItem[];
+} {
+  const kept: CalendarEventItem[] = [];
+  const removed: CalendarEventItem[] = [];
+  const seenRemote = new Set<string>();
+
+  const ranked = [...events].sort((a, b) => {
+    const ag = a.googleEventId ? 1 : 0;
+    const bg = b.googleEventId ? 1 : 0;
+    if (ag !== bg) return bg - ag;
+    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+  });
+
+  for (const ev of ranked) {
+    if (ev.googleEventId && seenRemote.has(ev.googleEventId)) {
+      removed.push(ev);
+      continue;
+    }
+    const twin = kept.find((k) => eventsLookSame(k, ev));
+    if (twin) {
+      removed.push(ev);
+      continue;
+    }
+    if (ev.googleEventId) seenRemote.add(ev.googleEventId);
+    kept.push(ev);
+  }
+
+  return { events: kept, removed };
+}
+
 /**
  * Busca eventos na Agenda Google (14 dias atrás até 60 dias à frente).
  * Inclui eventos com horário e all-day.
@@ -1163,10 +1242,14 @@ export function mergeGoogleCalendarEvents(
       continue;
     }
     seen.add(ev.googleEventId);
+    // Horário sugerido (soft) ainda não confirmado: não deixa o Calendar
+    // sobrescrever o horário local até o usuário resolver o prompt.
+    const protectSoft =
+      Boolean(ev.softTime) && !ev.softResolved && !ev.allDay;
     if (
       ev.title === rem.title &&
-      ev.startAt === rem.startAt &&
-      ev.endAt === rem.endAt &&
+      (protectSoft || ev.startAt === rem.startAt) &&
+      (protectSoft || ev.endAt === rem.endAt) &&
       (ev.notes ?? '') === (rem.notes ?? '') &&
       (ev.location ?? '') === (rem.location ?? '') &&
       Boolean(ev.allDay) === Boolean(rem.allDay)
@@ -1181,8 +1264,8 @@ export function mergeGoogleCalendarEvents(
       notes: rem.notes,
       location: rem.location,
       allDay: rem.allDay,
-      startAt: rem.startAt,
-      endAt: rem.endAt,
+      startAt: protectSoft ? ev.startAt : rem.startAt,
+      endAt: protectSoft ? ev.endAt : rem.endAt,
       wantsReminder: rem.wantsReminder,
       reminderMinutes: rem.reminderMinutes ?? ev.reminderMinutes,
     });
@@ -1193,6 +1276,15 @@ export function mergeGoogleCalendarEvents(
     if (seen.has(rem.googleEventId)) continue;
     if (local.some((e) => e.googleEventId === rem.googleEventId)) continue;
     if (dismissed.has(rem.googleEventId)) continue;
+    // Já temos o mesmo compromisso local (ainda sem id ou com outro id) → não duplica
+    if (kept.some((e) => eventsLookSame(e, rem))) continue;
+    if (
+      local.some(
+        (e) => !e.googleEventId && eventsLookSame(e, rem),
+      )
+    ) {
+      continue;
+    }
     changed += 1;
     imports.push({
       id: `gcal-${rem.googleEventId}`,

@@ -14,6 +14,8 @@ import {
   deleteTaskOnGoogle,
   fetchGoogleCalendarEvents,
   fetchGoogleTaskStatuses,
+  findMatchingRemoteEvent,
+  dedupeLocalEvents,
   loadGoogleTokens,
   mergeGoogleCalendarEvents,
   mergeGoogleTaskStatuses,
@@ -145,8 +147,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     useState<CalendarEventItem | null>(null);
   const softSnoozeRef = useRef<Set<string>>(new Set());
   const eventsRef = useRef<CalendarEventItem[]>([]);
+  const todosRef = useRef<TodoItem[]>([]);
   const softPromptIdRef = useRef<string | null>(null);
   const dismissedGoogleIdsRef = useRef<string[]>([]);
+  const syncAgendaLockRef = useRef(false);
+  const syncAgendaAgainRef = useRef(false);
+  const syncTasksLockRef = useRef(false);
+  const syncTasksAgainRef = useRef(false);
   const syncAgendaWithGoogleRef = useRef<
     ((opts?: { quiet?: boolean }) => Promise<void>) | null
   >(null);
@@ -160,8 +167,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [events]);
 
   useEffect(() => {
+    todosRef.current = todos;
+  }, [todos]);
+
+  useEffect(() => {
     softPromptIdRef.current = softPromptEvent?.id ?? null;
   }, [softPromptEvent]);
+
+  const commitTodos = useCallback((next: TodoItem[]) => {
+    todosRef.current = next;
+    setTodos(next);
+    void saveTodos(next);
+    return next;
+  }, []);
+
+  const commitEvents = useCallback((next: CalendarEventItem[]) => {
+    eventsRef.current = next;
+    setEvents(next);
+    void saveEvents(next);
+    return next;
+  }, []);
 
   // Feedback curto some sozinho (não fica eterno na tela)
   useEffect(() => {
@@ -186,25 +211,122 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const syncTasksFromGoogle = useCallback(async () => {
-    const tokens = await loadGoogleTokens();
-    if (!tokens?.accessToken) return;
+    if (syncTasksLockRef.current) {
+      syncTasksAgainRef.current = true;
+      return;
+    }
+    syncTasksLockRef.current = true;
+    try {
+      do {
+        syncTasksAgainRef.current = false;
+        const tokens = await loadGoogleTokens();
+        if (!tokens?.accessToken) return;
 
-    const remote = await fetchGoogleTaskStatuses();
-    if (!remote.ok) return;
+        const remote = await fetchGoogleTaskStatuses();
+        if (!remote.ok) return;
 
-    setTodos((prev) => {
-      const { todos: next, changed } = mergeGoogleTaskStatuses(prev, remote.items);
-      if (changed > 0) {
-        void saveTodos(next);
-        setLastSyncNote(
-          changed === 1
-            ? '1 tarefa atualizada a partir do Google Tasks.'
-            : `${changed} tarefas atualizadas a partir do Google Tasks.`,
+        let working = todosRef.current;
+        const usedRemoteIds = new Set(
+          working
+            .map((t) => t.googleTaskId)
+            .filter((id): id is string => Boolean(id)),
         );
-      }
-      return changed > 0 ? next : prev;
-    });
-  }, []);
+
+        // Liga tarefas locais órfãs a remotas com mesmo título (evita push duplicado)
+        let linked = 0;
+        for (const todo of working.filter((t) => !t.googleTaskId && !t.done)) {
+          const title = todo.title.trim().toLowerCase();
+          if (!title) continue;
+          const match = remote.items.find(
+            (r) =>
+              !usedRemoteIds.has(r.googleTaskId) &&
+              !r.done &&
+              (r.title ?? '').trim().toLowerCase() === title,
+          );
+          if (!match) continue;
+          linked += 1;
+          usedRemoteIds.add(match.googleTaskId);
+          working = working.map((t) =>
+            t.id === todo.id
+              ? { ...t, googleTaskId: match.googleTaskId }
+              : t,
+          );
+        }
+
+        let pushed = 0;
+        for (const todo of working.filter((t) => !t.googleTaskId && !t.done)) {
+          const sync = await pushTaskToGoogle(todo);
+          if (sync.ok && sync.remoteId) {
+            pushed += 1;
+            usedRemoteIds.add(sync.remoteId);
+            working = working.map((t) =>
+              t.id === todo.id
+                ? { ...t, googleTaskId: sync.remoteId }
+                : t,
+            );
+          }
+        }
+
+        const learnedIds = new Map(
+          working
+            .filter((t) => t.googleTaskId)
+            .map((t) => [t.id, t.googleTaskId as string]),
+        );
+        let base = todosRef.current.map((t) =>
+          learnedIds.has(t.id)
+            ? { ...t, googleTaskId: learnedIds.get(t.id) }
+            : t,
+        );
+        for (const w of working) {
+          if (!base.some((t) => t.id === w.id)) {
+            base = [w, ...base];
+          }
+        }
+
+        const prevTodos = base;
+        const { todos: next, changed } = mergeGoogleTaskStatuses(
+          prevTodos,
+          remote.items,
+        );
+        if (changed > 0 || linked > 0 || pushed > 0) {
+          for (const t of next) {
+            const was = prevTodos.find((x) => x.id === t.id);
+            if (t.done && was && !was.done) {
+              await cancelTodoLocalNotifications(t);
+            }
+          }
+          commitTodos(next);
+          const parts: string[] = [];
+          if (pushed > 0) {
+            parts.push(
+              pushed === 1
+                ? '1 tarefa enviada ao Google Tasks'
+                : `${pushed} tarefas enviadas ao Google Tasks`,
+            );
+          }
+          if (linked > 0) {
+            parts.push(
+              linked === 1
+                ? '1 tarefa ligada ao Google Tasks'
+                : `${linked} tarefas ligadas ao Google Tasks`,
+            );
+          }
+          if (changed > 0) {
+            parts.push(
+              changed === 1
+                ? '1 tarefa atualizada a partir do Google Tasks'
+                : `${changed} tarefas atualizadas a partir do Google Tasks`,
+            );
+          }
+          if (parts.length > 0) {
+            setLastSyncNote(parts.join(' · '));
+          }
+        }
+      } while (syncTasksAgainRef.current);
+    } finally {
+      syncTasksLockRef.current = false;
+    }
+  }, [commitTodos]);
 
   const syncEventsFromGoogle = useCallback(async () => {
     await syncAgendaWithGoogleRef.current?.({ quiet: true });
@@ -212,105 +334,217 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const syncAgendaWithGoogle = useCallback(
     async (opts?: { quiet?: boolean }) => {
-      const tokens = await loadGoogleTokens();
-      if (!tokens?.accessToken) {
-        if (!opts?.quiet) {
-          setLastSyncNote('Conecte o Google em Ajustes para sincronizar a agenda.');
-        }
+      if (syncAgendaLockRef.current) {
+        syncAgendaAgainRef.current = true;
         return;
       }
+      syncAgendaLockRef.current = true;
+      try {
+        do {
+          syncAgendaAgainRef.current = false;
+          const tokens = await loadGoogleTokens();
+          if (!tokens?.accessToken) {
+            if (!opts?.quiet) {
+              setLastSyncNote(
+                'Conecte o Google em Ajustes para sincronizar a agenda.',
+              );
+            }
+            return;
+          }
 
-      // 1) Eventos só do app → sempre vão para a Agenda (nunca apaga no Google)
-      let working = eventsRef.current;
-      let pushed = 0;
-      let pushFail = 0;
-      for (const ev of working.filter((e) => !e.googleEventId)) {
-        const sync = await pushEventToGoogle(ev);
-        if (sync.ok && sync.remoteId) {
-          pushed += 1;
-          working = working.map((e) =>
-            e.id === ev.id ? { ...e, googleEventId: sync.remoteId } : e,
+          const remote = await fetchGoogleCalendarEvents();
+          if (!remote.ok) {
+            if (!opts?.quiet) {
+              setLastSyncNote(remote.message);
+            }
+            return;
+          }
+
+          let working = eventsRef.current;
+          const usedRemoteIds = new Set(
+            working
+              .map((e) => e.googleEventId)
+              .filter((id): id is string => Boolean(id)),
           );
-        } else {
-          pushFail += 1;
-        }
-      }
-      if (pushed > 0) {
-        setEvents(working);
-        void saveEvents(working);
-      }
 
-      // 2) Puxa Calendar: importa novos, atualiza ligados, remove do app o que sumiu no Google
-      const remote = await fetchGoogleCalendarEvents();
-      if (!remote.ok) {
-        if (!opts?.quiet) {
-          setLastSyncNote(remote.message);
-        }
-        return;
-      }
+          let linked = 0;
+          for (const ev of working.filter((e) => !e.googleEventId)) {
+            const match = findMatchingRemoteEvent(
+              ev,
+              remote.items,
+              usedRemoteIds,
+            );
+            if (!match) continue;
+            linked += 1;
+            usedRemoteIds.add(match.googleEventId);
+            working = working.map((e) =>
+              e.id === ev.id
+                ? { ...e, googleEventId: match.googleEventId }
+                : e,
+            );
+          }
 
-      const { events: next, changed, removed, clearedDismissedIds } =
-        mergeGoogleCalendarEvents(working, remote.items, {
-          windowStartMs: remote.windowStartMs,
-          windowEndMs: remote.windowEndMs,
-          dismissedGoogleEventIds: dismissedGoogleIdsRef.current,
-        });
-      for (const gone of removed) {
-        await cancelEventLocalNotifications(gone);
-        softSnoozeRef.current.delete(gone.id);
-        if (softPromptIdRef.current === gone.id) setSoftPromptEvent(null);
-      }
-      if (clearedDismissedIds.length > 0) {
-        const clearSet = new Set(clearedDismissedIds);
-        dismissedGoogleIdsRef.current = dismissedGoogleIdsRef.current.filter(
-          (id) => !clearSet.has(id),
-        );
-        void saveDismissedGoogleEventIds(dismissedGoogleIdsRef.current);
-      }
-      if (changed > 0 || pushed > 0) {
-        setEvents(next);
-        void saveEvents(next);
-      }
+          let pushed = 0;
+          let pushFail = 0;
+          for (const ev of working.filter((e) => !e.googleEventId)) {
+            const sibling = working.find(
+              (o) =>
+                o.id !== ev.id &&
+                Boolean(o.googleEventId) &&
+                o.title.trim().toLowerCase() ===
+                  ev.title.trim().toLowerCase() &&
+                Math.abs(
+                  new Date(o.startAt).getTime() -
+                    new Date(ev.startAt).getTime(),
+                ) <= 3 * 60_000,
+            );
+            if (sibling?.googleEventId) {
+              working = working.map((e) =>
+                e.id === ev.id
+                  ? { ...e, googleEventId: sibling.googleEventId }
+                  : e,
+              );
+              linked += 1;
+              continue;
+            }
 
-      if (opts?.quiet && changed === 0 && pushed === 0) return;
+            const sync = await pushEventToGoogle(ev);
+            if (sync.ok && sync.remoteId) {
+              pushed += 1;
+              usedRemoteIds.add(sync.remoteId);
+              working = working.map((e) =>
+                e.id === ev.id
+                  ? { ...e, googleEventId: sync.remoteId }
+                  : e,
+              );
+            } else {
+              pushFail += 1;
+            }
+          }
 
-      const parts: string[] = [];
-      if (pushed > 0) {
-        parts.push(
-          pushed === 1
-            ? '1 evento enviado à Agenda'
-            : `${pushed} eventos enviados à Agenda`,
-        );
+          // Reconcilia com o estado atual (não apaga o que o usuário criou durante o sync)
+          const learnedIds = new Map(
+            working
+              .filter((e) => e.googleEventId)
+              .map((e) => [e.id, e.googleEventId as string]),
+          );
+          let base = eventsRef.current.map((e) =>
+            learnedIds.has(e.id)
+              ? { ...e, googleEventId: learnedIds.get(e.id) }
+              : e,
+          );
+          for (const w of working) {
+            if (!base.some((e) => e.id === w.id)) {
+              base = [w, ...base];
+            }
+          }
+
+          const merged = mergeGoogleCalendarEvents(base, remote.items, {
+            windowStartMs: remote.windowStartMs,
+            windowEndMs: remote.windowEndMs,
+            dismissedGoogleEventIds: dismissedGoogleIdsRef.current,
+          });
+          const { events: deduped, removed: localDupes } = dedupeLocalEvents(
+            merged.events,
+          );
+          const removed = [...merged.removed, ...localDupes];
+          const changed =
+            merged.changed + localDupes.length + linked + pushed;
+
+          for (const gone of removed) {
+            await cancelEventLocalNotifications(gone);
+            softSnoozeRef.current.delete(gone.id);
+            if (softPromptIdRef.current === gone.id) {
+              setSoftPromptEvent(null);
+            }
+          }
+          if (merged.clearedDismissedIds.length > 0) {
+            const clearSet = new Set(merged.clearedDismissedIds);
+            dismissedGoogleIdsRef.current =
+              dismissedGoogleIdsRef.current.filter((id) => !clearSet.has(id));
+            void saveDismissedGoogleEventIds(dismissedGoogleIdsRef.current);
+          }
+
+          if (
+            changed > 0 ||
+            pushed > 0 ||
+            linked > 0 ||
+            localDupes.length > 0
+          ) {
+            commitEvents(deduped);
+          }
+
+          if (
+            opts?.quiet &&
+            changed === 0 &&
+            pushed === 0 &&
+            linked === 0 &&
+            localDupes.length === 0
+          ) {
+            continue;
+          }
+
+          const parts: string[] = [];
+          if (pushed > 0) {
+            parts.push(
+              pushed === 1
+                ? '1 evento enviado à Agenda'
+                : `${pushed} eventos enviados à Agenda`,
+            );
+          }
+          if (linked > 0) {
+            parts.push(
+              linked === 1
+                ? '1 evento ligado ao Calendar'
+                : `${linked} eventos ligados ao Calendar`,
+            );
+          }
+          if (localDupes.length > 0) {
+            parts.push(
+              localDupes.length === 1
+                ? '1 cópia duplicada removida no app'
+                : `${localDupes.length} cópias duplicadas removidas no app`,
+            );
+          }
+          if (merged.removed.length > 0) {
+            parts.push(
+              merged.removed.length === 1
+                ? '1 compromisso removido (apagado no Calendar)'
+                : `${merged.removed.length} compromissos removidos (apagados no Calendar)`,
+            );
+          }
+          const importedOrUpdated = Math.max(
+            0,
+            merged.changed - merged.removed.length,
+          );
+          if (importedOrUpdated > 0) {
+            parts.push(
+              importedOrUpdated === 1
+                ? '1 evento atualizado do Calendar'
+                : `${importedOrUpdated} eventos atualizados do Calendar`,
+            );
+          }
+          if (pushFail > 0) {
+            parts.push(
+              pushFail === 1
+                ? '1 evento local não foi enviado'
+                : `${pushFail} eventos locais não foram enviados`,
+            );
+          }
+          if (!opts?.quiet || parts.length > 0) {
+            setLastSyncNote(
+              parts.length > 0
+                ? parts.join(' · ')
+                : 'Agenda já estava sincronizada.',
+            );
+          }
+        } while (syncAgendaAgainRef.current);
+      } finally {
+        syncAgendaLockRef.current = false;
       }
-      if (removed.length > 0) {
-        parts.push(
-          removed.length === 1
-            ? '1 compromisso removido (apagado no Calendar)'
-            : `${removed.length} compromissos removidos (apagados no Calendar)`,
-        );
-      }
-      const importedOrUpdated = Math.max(0, changed - removed.length);
-      if (importedOrUpdated > 0) {
-        parts.push(
-          importedOrUpdated === 1
-            ? '1 evento atualizado do Calendar'
-            : `${importedOrUpdated} eventos atualizados do Calendar`,
-        );
-      }
-      if (pushFail > 0) {
-        parts.push(
-          pushFail === 1
-            ? '1 evento local não foi enviado'
-            : `${pushFail} eventos locais não foram enviados`,
-        );
-      }
-      setLastSyncNote(
-        parts.length > 0 ? parts.join(' · ') : 'Agenda já estava sincronizada.',
-      );
     },
-    [],
+    [commitEvents],
   );
-
   syncAgendaWithGoogleRef.current = syncAgendaWithGoogle;
 
   const syncingRef = useRef(false);
@@ -343,7 +577,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       ]);
       const tokens = await loadGoogleTokens();
       setTodos(t);
+      todosRef.current = t;
       setEvents(e);
+      eventsRef.current = e;
       setHistory(h);
       setInputQueue(q);
       dismissedGoogleIdsRef.current = dismissed;
@@ -357,6 +593,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             true,
           );
           setEvents(syncedEvents);
+          eventsRef.current = syncedEvents;
           void saveEvents(syncedEvents);
           const syncedTodos = await resyncTaskReminderSeries(
             t,
@@ -364,6 +601,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             true,
           );
           setTodos(syncedTodos);
+          todosRef.current = syncedTodos;
           void saveTodos(syncedTodos);
         })();
       }
@@ -442,8 +680,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
         }
         const nextTodos = [todo, ...currentTodos];
-        setTodos(nextTodos);
-        void saveTodos(nextTodos);
+        commitTodos(nextTodos);
         const dueHint = dueAt ? ` · prazo ${formatDueDatePtBr(dueAt)}` : '';
         const seriesHint = reminderSeries
           ? ` · a cada ${reminderSeries.intervalMinutes} min (${reminderSeries.fromHour}h–${reminderSeries.toHour}h)`
@@ -471,8 +708,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const nextTodos = currentTodos.map((t) =>
           t.id === match.id ? updated : t,
         );
-        setTodos(nextTodos);
-        void saveTodos(nextTodos);
+        commitTodos(nextTodos);
         if (shouldSync && updated.googleTaskId) {
           const sync = await updateTaskOnGoogle(updated);
           setLastSyncNote(sync.message);
@@ -504,8 +740,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const nextTodos = currentTodos.map((t) =>
           t.id === match.id ? { ...updated, localNotificationIds: undefined } : t,
         );
-        setTodos(nextTodos);
-        void saveTodos(nextTodos);
+        commitTodos(nextTodos);
         if (shouldSync && updated.googleTaskId) {
           const sync = await completeTaskOnGoogle(updated);
           setLastSyncNote(sync.message);
@@ -526,8 +761,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         await cancelTodoLocalNotifications(match);
         const nextTodos = currentTodos.filter((t) => t.id !== match.id);
-        setTodos(nextTodos);
-        void saveTodos(nextTodos);
+        commitTodos(nextTodos);
         if (shouldSync && match.googleTaskId) {
           const sync = await deleteTaskOnGoogle(match);
           setLastSyncNote(sync.message);
@@ -613,11 +847,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             );
           }
         }
-        setEvents((prev) => {
-          const next = [event, ...prev];
-          void saveEvents(next);
-          return next;
-        });
+        commitEvents([event, ...eventsRef.current]);
         const reminderHint =
           wantsReminder && reminderMinutes != null
             ? ` · lembrete ${reminderMinutes} min`
@@ -635,49 +865,46 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       if (item.action === 'reschedule_event') {
         const needle = item.title.toLowerCase();
-        let updatedEvent: CalendarEventItem | undefined;
-        setEvents((prev) => {
-          const match = prev.find(
-            (e) =>
-              e.title.toLowerCase().includes(needle) ||
-              needle.includes(e.title.toLowerCase()),
-          );
-          if (!match || !item.datetime) return prev;
-          const start = new Date(item.datetime);
-          const duration =
-            item.durationMinutes ??
-            Math.max(
-              30,
-              Math.round(
-                (new Date(match.endAt).getTime() -
-                  new Date(match.startAt).getTime()) /
-                  60_000,
-              ),
-            );
-          const end = new Date(start.getTime() + duration * 60_000);
-          updatedEvent = {
-            ...match,
-            startAt: start.toISOString(),
-            endAt: end.toISOString(),
-            reminderMinutes:
-              item.reminderMinutes ?? match.reminderMinutes ?? 30,
-            wantsReminder: item.wantsReminder ?? match.wantsReminder,
-            softTime: undefined,
-            softResolved: true,
-          };
-          const next = prev.map((e) =>
-            e.id === match.id ? (updatedEvent as CalendarEventItem) : e,
-          );
-          void saveEvents(next);
-          return next;
-        });
-        if (!updatedEvent) {
+        const prevEvents = eventsRef.current;
+        const match = prevEvents.find(
+          (e) =>
+            e.title.toLowerCase().includes(needle) ||
+            needle.includes(e.title.toLowerCase()),
+        );
+        if (!match || !item.datetime) {
           return {
             detail: 'Nenhum evento para remarcar',
             success: false,
             todos: currentTodos,
           };
         }
+        const start = new Date(item.datetime);
+        const duration =
+          item.durationMinutes ??
+          Math.max(
+            30,
+            Math.round(
+              (new Date(match.endAt).getTime() -
+                new Date(match.startAt).getTime()) /
+                60_000,
+            ),
+          );
+        const end = new Date(start.getTime() + duration * 60_000);
+        let updatedEvent: CalendarEventItem = {
+          ...match,
+          startAt: start.toISOString(),
+          endAt: end.toISOString(),
+          reminderMinutes:
+            item.reminderMinutes ?? match.reminderMinutes ?? 30,
+          wantsReminder: item.wantsReminder ?? match.wantsReminder,
+          softTime: undefined,
+          softResolved: true,
+        };
+        commitEvents(
+          prevEvents.map((e) =>
+            e.id === match.id ? updatedEvent : e,
+          ),
+        );
         await cancelEventLocalNotifications(updatedEvent);
         if (updatedEvent.wantsReminder && settings.notificationsEnabled) {
           const notifId = await scheduleEventReminder(
@@ -686,13 +913,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           );
           if (notifId) {
             updatedEvent = { ...updatedEvent, localNotificationId: notifId };
-            setEvents((prev) => {
-              const next = prev.map((e) =>
-                e.id === updatedEvent!.id ? updatedEvent! : e,
-              );
-              void saveEvents(next);
-              return next;
-            });
+            commitEvents(
+              eventsRef.current.map((e) =>
+                e.id === updatedEvent.id ? updatedEvent : e,
+              ),
+            );
             setLastSyncNote('Lembrete reagendado no celular.');
           } else {
             setLastSyncNote(
@@ -738,7 +963,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         todos: currentTodos,
       };
     },
-    [settings.notificationsEnabled, settings.reminderSound],
+    [settings.notificationsEnabled, settings.reminderSound, commitTodos, commitEvents],
   );
 
   const applyBatch = useCallback(
@@ -746,12 +971,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const createdAt = new Date().toISOString();
       const shouldSync = settings.googleConnected && settings.syncToGoogle;
 
-      // Snapshot for 8s undo (especially voice hands-free)
       const snapshot: UndoSnapshot = {
         id: id(),
         label: batch.summary || 'última ação',
-        todos: todos,
-        events: events,
+        todos: todosRef.current,
+        events: eventsRef.current,
         expiresAt: Date.now() + UNDO_WINDOW_MS,
       };
       setUndoSnapshot(snapshot);
@@ -759,7 +983,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setUndoSnapshot((cur) => (cur?.id === snapshot.id ? null : cur));
       }, UNDO_WINDOW_MS);
 
-      let workingTodos = todos;
+      let workingTodos = todosRef.current;
       const details: string[] = [];
       let anySuccess = false;
       let anyUnknown = false;
@@ -774,6 +998,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           workingTodos,
         );
         workingTodos = result.todos;
+        todosRef.current = workingTodos;
         details.push(result.detail);
         if (result.success) anySuccess = true;
       }
@@ -810,11 +1035,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     },
     [
       applyItem,
-      events,
       persistHistory,
       settings.googleConnected,
       settings.syncToGoogle,
-      todos,
     ],
   );
 
@@ -823,13 +1046,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setUndoSnapshot(null);
       return;
     }
-    setTodos(undoSnapshot.todos);
-    setEvents(undoSnapshot.events);
-    await saveTodos(undoSnapshot.todos);
-    await saveEvents(undoSnapshot.events);
+    commitTodos(undoSnapshot.todos);
+    commitEvents(undoSnapshot.events);
     setUndoSnapshot(null);
     setLastSyncNote('Ação desfeita.');
-  }, [undoSnapshot]);
+  }, [undoSnapshot, commitTodos, commitEvents]);
 
   const shareOpenTasks = useCallback(
     async (category?: string) => {
@@ -861,13 +1082,78 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       source,
       createdAt: new Date().toISOString(),
     };
-    setInputQueue((prev) => {
-      const next = [...prev, entry];
-      void saveInputQueue(next);
-      return next;
-    });
+    const next = [...inputQueueRef.current, entry];
+    inputQueueRef.current = next;
+    void saveInputQueue(next);
+    setInputQueue(next);
     return entry;
   }, []);
+
+  const drainInputQueue = useCallback(async () => {
+    if (drainingQueueRef.current) return;
+    if (inputQueueRef.current.length === 0) return;
+    drainingQueueRef.current = true;
+    setQueueProcessing(true);
+    try {
+      while (inputQueueRef.current.length > 0) {
+        const online = await isOnline();
+        if (!online) {
+          setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
+          break;
+        }
+        const head = inputQueueRef.current[0];
+        if (!head) break;
+        setError(null);
+        const openTitles = todosRef.current
+          .filter((t) => !t.done)
+          .map((t) => t.title);
+        const batch = await parseUserIntent(
+          head.text,
+          settings.aiApiKey,
+          openTitles,
+        );
+        const onlyList =
+          batch.items.length > 0 &&
+          batch.items.every((i) => i.action === 'list_tasks');
+        if (settings.confirmBeforeSave && !onlyList) {
+          setPending({ batch, source: head.source });
+          setLastSyncNote('Fila pausada aguardando sua confirmação.');
+          break;
+        }
+        await applyBatch(batch, head.source);
+        if (inputQueueRef.current[0]?.id === head.id) {
+          const next = inputQueueRef.current.slice(1);
+          inputQueueRef.current = next;
+          void saveInputQueue(next);
+          setInputQueue(next);
+        }
+        const left = inputQueueRef.current.length;
+        setLastSyncNote(
+          left > 0
+            ? `Fila: processado. Restam ${left}.`
+            : 'Fila processada.',
+        );
+      }
+    } catch (e) {
+      const message =
+        e instanceof Error ? e.message : 'Falha ao processar fila.';
+      if (isLikelyNetworkError(message)) {
+        setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
+      } else {
+        // Item inválido: remove só o primeiro para destravar.
+        if (inputQueueRef.current.length > 0) {
+          const next = inputQueueRef.current.slice(1);
+          inputQueueRef.current = next;
+          void saveInputQueue(next);
+          setInputQueue(next);
+        }
+        setError(message);
+      }
+    } finally {
+      drainingQueueRef.current = false;
+      setQueueProcessing(false);
+    }
+  }, [applyBatch, settings.aiApiKey, settings.confirmBeforeSave]);
 
   const submitInput = useCallback(
     async (text: string, source: InputSource) => {
@@ -888,72 +1174,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
       void drainInputQueue();
     },
-    [enqueueInput],
+    [enqueueInput, drainInputQueue],
   );
-
-  const drainInputQueue = useCallback(async () => {
-    if (drainingQueueRef.current) return;
-    if (inputQueueRef.current.length === 0) return;
-    drainingQueueRef.current = true;
-    setQueueProcessing(true);
-    try {
-      // FIFO real: processa em cadeia até acabar, sem bloquear novo enqueue.
-      while (inputQueueRef.current.length > 0) {
-        const online = await isOnline();
-        if (!online) {
-          setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
-          break;
-        }
-        const head = inputQueueRef.current[0];
-        if (!head) break;
-        setError(null);
-        const openTitles = todos.filter((t) => !t.done).map((t) => t.title);
-        const batch = await parseUserIntent(
-          head.text,
-          settings.aiApiKey,
-          openTitles,
-        );
-        const onlyList =
-          batch.items.length > 0 &&
-          batch.items.every((i) => i.action === 'list_tasks');
-        if (settings.confirmBeforeSave && !onlyList) {
-          setPending({ batch, source: head.source });
-          setLastSyncNote('Fila pausada aguardando sua confirmação.');
-          break;
-        }
-        await applyBatch(batch, head.source);
-        setInputQueue((prev) => {
-          if (prev[0]?.id !== head.id) return prev;
-          const next = prev.slice(1);
-          void saveInputQueue(next);
-          return next;
-        });
-        const left = Math.max(0, inputQueueRef.current.length - 1);
-        setLastSyncNote(
-          left > 0
-            ? `Fila: processado. Restam ${left}.`
-            : 'Fila processada.',
-        );
-      }
-    } catch (e) {
-      const message =
-        e instanceof Error ? e.message : 'Falha ao processar fila.';
-      if (isLikelyNetworkError(message)) {
-        setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
-      } else {
-        // Item inválido: remove só o primeiro para destravar.
-        setInputQueue((prev) => {
-          const next = prev.slice(1);
-          void saveInputQueue(next);
-          return next;
-        });
-        setError(message);
-      }
-    } finally {
-      drainingQueueRef.current = false;
-      setQueueProcessing(false);
-    }
-  }, [applyBatch, settings.aiApiKey, settings.confirmBeforeSave, todos]);
 
   useEffect(() => {
     if (!ready) return;
@@ -982,12 +1204,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       await applyBatch(pending.batch, pending.source);
       setPending(null);
-      setInputQueue((prev) => {
-        if (prev.length === 0) return prev;
-        const next = prev.slice(1);
+      if (inputQueueRef.current.length > 0) {
+        const next = inputQueueRef.current.slice(1);
+        inputQueueRef.current = next;
         void saveInputQueue(next);
-        return next;
-      });
+        setInputQueue(next);
+      }
       setLastSyncNote('Pedido confirmado e executado.');
     } finally {
       setBusy(false);
@@ -997,12 +1219,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const cancelPending = useCallback(() => {
     setPending(null);
-    setInputQueue((prev) => {
-      if (prev.length === 0) return prev;
-      const next = prev.slice(1);
+    if (inputQueueRef.current.length > 0) {
+      const next = inputQueueRef.current.slice(1);
+      inputQueueRef.current = next;
       void saveInputQueue(next);
-      return next;
-    });
+      setInputQueue(next);
+    }
     setLastSyncNote('Pedido da fila cancelado.');
     void drainInputQueue();
   }, [drainInputQueue]);
@@ -1049,47 +1271,37 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const toggleTodoDone = useCallback(
     async (todoId: string) => {
-      let updated: TodoItem | undefined;
-      setTodos((prev) => {
-        const next = prev.map((t) => {
-          if (t.id !== todoId) return t;
-          const done = !t.done;
-          updated = {
-            ...t,
-            done,
-            completedAt: done ? new Date().toISOString() : undefined,
-            localNotificationIds: done ? undefined : t.localNotificationIds,
-          };
-          return updated;
-        });
-        void saveTodos(next);
-        return next;
-      });
-      if (updated) {
-        if (updated.done) {
-          await cancelTodoLocalNotifications(updated);
-        } else if (
-          updated.reminderSeries &&
-          settings.notificationsEnabled
-        ) {
-          const ids = await scheduleTaskReminderSeries(
-            updated,
-            settings.reminderSound,
+      const prev = todosRef.current;
+      const current = prev.find((t) => t.id === todoId);
+      if (!current) return;
+      const done = !current.done;
+      let updated: TodoItem = {
+        ...current,
+        done,
+        completedAt: done ? new Date().toISOString() : undefined,
+        localNotificationIds: done ? undefined : current.localNotificationIds,
+      };
+      commitTodos(prev.map((t) => (t.id === todoId ? updated : t)));
+      if (updated.done) {
+        await cancelTodoLocalNotifications(updated);
+      } else if (
+        updated.reminderSeries &&
+        settings.notificationsEnabled
+      ) {
+        const ids = await scheduleTaskReminderSeries(
+          updated,
+          settings.reminderSound,
+        );
+        if (ids.length > 0) {
+          updated = { ...updated, localNotificationIds: ids };
+          commitTodos(
+            todosRef.current.map((t) =>
+              t.id === updated.id ? updated : t,
+            ),
           );
-          if (ids.length > 0) {
-            const withIds = { ...updated, localNotificationIds: ids };
-            setTodos((prev) => {
-              const next = prev.map((t) =>
-                t.id === withIds.id ? withIds : t,
-              );
-              void saveTodos(next);
-              return next;
-            });
-          }
         }
       }
       if (
-        updated &&
         settings.googleConnected &&
         settings.syncToGoogle &&
         updated.googleTaskId
@@ -1099,6 +1311,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [
+      commitTodos,
       settings.googleConnected,
       settings.syncToGoogle,
       settings.notificationsEnabled,
@@ -1108,18 +1321,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const setTodoDue = useCallback(
     async (todoId: string, dueAt: string | null) => {
-      let updated: TodoItem | undefined;
-      setTodos((prev) => {
-        const next = prev.map((t) => {
-          if (t.id !== todoId) return t;
-          updated = { ...t, dueAt: dueAt ?? undefined };
-          return updated;
-        });
-        void saveTodos(next);
-        return next;
-      });
+      const prev = todosRef.current;
+      const current = prev.find((t) => t.id === todoId);
+      if (!current) return;
+      const updated: TodoItem = { ...current, dueAt: dueAt ?? undefined };
+      commitTodos(prev.map((t) => (t.id === todoId ? updated : t)));
       if (
-        updated &&
         settings.googleConnected &&
         settings.syncToGoogle &&
         updated.googleTaskId
@@ -1128,42 +1335,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setLastSyncNote(sync.message);
       }
     },
-    [settings.googleConnected, settings.syncToGoogle],
+    [commitTodos, settings.googleConnected, settings.syncToGoogle],
   );
 
   const deleteTodo = useCallback(
     async (todoId: string) => {
-      let removed: TodoItem | undefined;
-      setTodos((prev) => {
-        removed = prev.find((t) => t.id === todoId);
-        const next = prev.filter((t) => t.id !== todoId);
-        void saveTodos(next);
-        return next;
-      });
-      if (removed) {
-        await cancelTodoLocalNotifications(removed);
-        if (
-          settings.googleConnected &&
-          settings.syncToGoogle &&
-          removed.googleTaskId
-        ) {
-          const sync = await deleteTaskOnGoogle(removed);
-          setLastSyncNote(sync.message);
-        }
+      const prev = todosRef.current;
+      const removed = prev.find((t) => t.id === todoId);
+      if (!removed) return;
+      commitTodos(prev.filter((t) => t.id !== todoId));
+      await cancelTodoLocalNotifications(removed);
+      if (
+        settings.googleConnected &&
+        settings.syncToGoogle &&
+        removed.googleTaskId
+      ) {
+        const sync = await deleteTaskOnGoogle(removed);
+        setLastSyncNote(sync.message);
       }
     },
-    [settings.googleConnected, settings.syncToGoogle],
+    [commitTodos, settings.googleConnected, settings.syncToGoogle],
   );
 
   const deleteEvent = useCallback(async (eventId: string) => {
     const target = eventsRef.current.find((e) => e.id === eventId);
     if (!target) return;
 
-    setEvents((prev) => {
-      const next = prev.filter((e) => e.id !== eventId);
-      void saveEvents(next);
-      return next;
-    });
+    commitEvents(eventsRef.current.filter((e) => e.id !== eventId));
     await cancelEventLocalNotifications(target);
     softSnoozeRef.current.delete(eventId);
     if (softPromptIdRef.current === eventId) setSoftPromptEvent(null);
@@ -1184,7 +1382,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
 
     setLastSyncNote('Evento removido.');
-  }, []);
+  }, [commitEvents]);
 
   const scanSoftPrompt = useCallback(() => {
     if (softPromptEvent) return;
@@ -1211,57 +1409,47 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const resolveSoftTimeDone = useCallback(async (eventId: string) => {
     softSnoozeRef.current.delete(eventId);
     setSoftPromptEvent(null);
-    let updated: CalendarEventItem | undefined;
-    setEvents((prev) => {
-      const next = prev.map((e) => {
-        if (e.id !== eventId) return e;
-        updated = { ...e, softResolved: true };
-        return updated;
-      });
-      void saveEvents(next);
-      return next;
-    });
-    if (updated) {
-      await cancelEventLocalNotifications(updated);
-      setLastSyncNote('Compromisso marcado como feito.');
-    }
-  }, []);
+    const match = eventsRef.current.find((e) => e.id === eventId);
+    if (!match) return;
+    const updated: CalendarEventItem = { ...match, softResolved: true };
+    commitEvents(
+      eventsRef.current.map((e) => (e.id === eventId ? updated : e)),
+    );
+    await cancelEventLocalNotifications(updated);
+    setLastSyncNote('Compromisso marcado como feito.');
+  }, [commitEvents]);
 
   const resolveSoftTimeReschedule = useCallback(
     async (eventId: string, hour: number) => {
       softSnoozeRef.current.delete(eventId);
       setSoftPromptEvent(null);
-      let updated: CalendarEventItem | undefined;
-      setEvents((prev) => {
-        const match = prev.find((e) => e.id === eventId);
-        if (!match) return prev;
-        const dayKey = dayKeySaoPaulo(match.startAt);
-        const duration = Math.max(
-          30,
-          Math.round(
-            (new Date(match.endAt).getTime() -
-              new Date(match.startAt).getTime()) /
-              60_000,
-          ),
-        );
-        const startAt = atHourSaoPaulo(dayKey, hour);
-        const endAt = new Date(
-          new Date(startAt).getTime() + duration * 60_000,
-        ).toISOString();
-        updated = {
-          ...match,
-          startAt,
-          endAt,
-          softTime: undefined,
-          softResolved: true,
-          wantsReminder: true,
-          reminderMinutes: match.reminderMinutes ?? 30,
-        };
-        const next = prev.map((e) => (e.id === eventId ? updated! : e));
-        void saveEvents(next);
-        return next;
-      });
-      if (!updated) return;
+      const match = eventsRef.current.find((e) => e.id === eventId);
+      if (!match) return;
+      const dayKey = dayKeySaoPaulo(match.startAt);
+      const duration = Math.max(
+        30,
+        Math.round(
+          (new Date(match.endAt).getTime() -
+            new Date(match.startAt).getTime()) /
+            60_000,
+        ),
+      );
+      const startAt = atHourSaoPaulo(dayKey, hour);
+      const endAt = new Date(
+        new Date(startAt).getTime() + duration * 60_000,
+      ).toISOString();
+      let updated: CalendarEventItem = {
+        ...match,
+        startAt,
+        endAt,
+        softTime: undefined,
+        softResolved: true,
+        wantsReminder: true,
+        reminderMinutes: match.reminderMinutes ?? 30,
+      };
+      commitEvents(
+        eventsRef.current.map((e) => (e.id === eventId ? updated : e)),
+      );
       await cancelEventLocalNotifications(updated);
       if (settings.notificationsEnabled) {
         const notifId = await scheduleEventReminder(
@@ -1270,13 +1458,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         );
         if (notifId) {
           updated = { ...updated, localNotificationId: notifId };
-          setEvents((prev) => {
-            const next = prev.map((e) =>
-              e.id === updated!.id ? updated! : e,
-            );
-            void saveEvents(next);
-            return next;
-          });
+          commitEvents(
+            eventsRef.current.map((e) =>
+              e.id === updated.id ? updated : e,
+            ),
+          );
         }
       }
       if (
@@ -1295,6 +1481,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [
+      commitEvents,
       settings.notificationsEnabled,
       settings.reminderSound,
       settings.googleConnected,
