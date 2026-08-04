@@ -466,8 +466,8 @@ export function HomeScreen() {
             <Text style={styles.syncNote}>
               {queueProcessing
                 ? queuedCount === 1
-                  ? 'Processando fila (1 restante)'
-                  : `Processando fila (${queuedCount} restantes)`
+                  ? 'Processando (pode trocar de app)'
+                  : `Processando fila (${queuedCount}) — pode trocar de app`
                 : queuedCount === 1
                   ? '1 pedido aguardando na fila'
                   : `${queuedCount} pedidos aguardando na fila`}

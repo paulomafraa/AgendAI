@@ -2,7 +2,7 @@
   "expo": {
     "name": "AgendAI",
     "slug": "agendai",
-    "version": "1.0.14",
+    "version": "1.0.15",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "agendai",
@@ -22,7 +22,7 @@
     },
     "android": {
       "package": "com.agendai.app",
-      "versionCode": 18,
+      "versionCode": 19,
       "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "backgroundColor": "#CCFBF1",
@@ -38,7 +38,9 @@
         "android.permission.USE_FULL_SCREEN_INTENT",
         "android.permission.RECEIVE_BOOT_COMPLETED",
         "android.permission.VIBRATE",
-        "android.permission.WAKE_LOCK"
+        "android.permission.WAKE_LOCK",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
       ],
       "predictiveBackGestureEnabled": false,
       "intentFilters": [
@@ -138,7 +140,8 @@
             }
           ]
         }
-      ]
+      ],
+      "./plugins/withBackgroundActions"
     ],
     "extra": {
       "googleOAuth": {

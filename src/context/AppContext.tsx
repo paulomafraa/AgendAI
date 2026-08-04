@@ -54,6 +54,12 @@ import {
   isOnline,
   onAppBecameActive,
 } from '../services/network';
+import {
+  startQueueKeepAlive,
+  stopQueueKeepAlive,
+  updateQueueKeepAliveNotification,
+  isQueueKeepAliveRunning,
+} from '../services/queueKeepAlive';
 import { syncWidgetsFromData } from '../widgets/refresh';
 import { formatDueDatePtBr } from '../services/ai/shared';
 import {
@@ -1094,8 +1100,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (inputQueueRef.current.length === 0) return;
     drainingQueueRef.current = true;
     setQueueProcessing(true);
+    // Precisa iniciar ainda em primeiro plano (Android 12+).
+    await startQueueKeepAlive(inputQueueRef.current.length);
     try {
       while (inputQueueRef.current.length > 0) {
+        await updateQueueKeepAliveNotification(inputQueueRef.current.length);
         const online = await isOnline();
         if (!online) {
           setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
@@ -1152,6 +1161,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     } finally {
       drainingQueueRef.current = false;
       setQueueProcessing(false);
+      await stopQueueKeepAlive();
     }
   }, [applyBatch, settings.aiApiKey, settings.confirmBeforeSave]);
 
@@ -1164,6 +1174,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       try {
         await enqueueInput(trimmed, source);
         const queuedNow = inputQueueRef.current.length;
+        // Inicia o keep-alive ainda em primeiro plano (Android 12+).
+        await startQueueKeepAlive(queuedNow);
         setLastSyncNote(
           queuedNow > 1
             ? `Pedido adicionado. Fila com ${queuedNow} itens.`
@@ -1180,13 +1192,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!ready) return;
     void drainInputQueue();
-    const stop = onAppBecameActive(() => {
-      void drainInputQueue();
-    });
-    const appStateSub = AppState.addEventListener('change', (state) => {
-      if (state === 'active' || state === 'background') {
-        void drainInputQueue();
+    const resumeQueue = () => {
+      // Lock preso sem keep-alive (JS congelou ao sair do app) → libera.
+      if (
+        drainingQueueRef.current &&
+        !isQueueKeepAliveRunning() &&
+        inputQueueRef.current.length > 0
+      ) {
+        drainingQueueRef.current = false;
       }
+      void drainInputQueue();
+    };
+    const stop = onAppBecameActive(resumeQueue);
+    const appStateSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') resumeQueue();
     });
     const interval = setInterval(() => {
       void drainInputQueue();
