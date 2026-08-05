@@ -2,7 +2,7 @@
   "expo": {
     "name": "AgendAI",
     "slug": "agendai",
-    "version": "1.0.15",
+    "version": "1.0.16",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "agendai",
@@ -22,7 +22,7 @@
     },
     "android": {
       "package": "com.agendai.app",
-      "versionCode": 19,
+      "versionCode": 20,
       "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "backgroundColor": "#CCFBF1",

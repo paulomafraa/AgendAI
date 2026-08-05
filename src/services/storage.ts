@@ -20,10 +20,13 @@ const KEYS = {
   settings: '@agendai/settings',
   inputQueue: '@agendai/input_queue',
   dismissedGoogleEvents: '@agendai/dismissed_google_events',
+  lastGoogleDailySync: '@agendai/last_google_daily_sync',
   aiKey: 'agendai_ai_api_key',
   geminiKey: 'agendai_gemini_api_key',
   googleClientId: 'agendai_google_web_client_id',
 } as const;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const defaultSettings: AppSettings = {
   confirmBeforeSave: false,
@@ -229,6 +232,26 @@ export async function saveDismissedGoogleEventIds(
     KEYS.dismissedGoogleEvents,
     JSON.stringify(unique.slice(0, LIMITS.dismissedGoogleEvents)),
   );
+}
+
+export async function loadLastGoogleDailySyncAt(): Promise<number | null> {
+  try {
+    const raw = await AsyncStorage.getItem(KEYS.lastGoogleDailySync);
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveLastGoogleDailySyncAt(atMs: number): Promise<void> {
+  await AsyncStorage.setItem(KEYS.lastGoogleDailySync, String(atMs));
+}
+
+export function isGoogleDailySyncDue(lastAt: number | null): boolean {
+  if (lastAt == null) return true;
+  return Date.now() - lastAt >= DAY_MS;
 }
 
 export async function loadSettings(): Promise<AppSettings> {

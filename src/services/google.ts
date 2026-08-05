@@ -247,16 +247,19 @@ export async function finishGoogleAuth(params: {
       refreshToken: tokenResult.refreshToken,
       expiresAt: tokenResult.expiresIn
         ? Date.now() + tokenResult.expiresIn * 1000
-        : undefined,
+        : Date.now() + 55 * 60 * 1000,
       email,
     };
     await saveGoogleTokens(tokens);
 
+    const sessionHint = tokens.refreshToken
+      ? ''
+      : ' Se pedir login de novo em breve, conecte outra vez aceitando todas as permissões.';
     return {
       ok: true,
       message: email
-        ? `Conectado como ${email}. Novas tarefas/eventos vão para o Google.`
-        : 'Google conectado. Novas tarefas/eventos serão sincronizados.',
+        ? `Conectado como ${email}. Novas tarefas/eventos vão para o Google.${sessionHint}`
+        : `Google conectado. Novas tarefas/eventos serão sincronizados.${sessionHint}`,
     };
   } catch (e) {
     return {
@@ -283,7 +286,7 @@ export async function connectGoogleAccount(): Promise<GoogleConnectResult> {
       const tokens: GoogleTokens = {
         accessToken: native.accessToken,
         refreshToken: native.refreshToken,
-        expiresAt: native.expiresAt,
+        expiresAt: native.expiresAt ?? Date.now() + 55 * 60 * 1000,
         email: native.email,
       };
       if (!tokens.email) {
@@ -291,11 +294,14 @@ export async function connectGoogleAccount(): Promise<GoogleConnectResult> {
       }
       await saveGoogleTokens(tokens);
       pendingGoogleAuth = null;
+      const sessionHint = tokens.refreshToken
+        ? ''
+        : ' Se pedir login de novo em breve, Desconecte e conecte outra vez (aceite todas as permissões).';
       return {
         ok: true,
         message: tokens.email
-          ? `Conectado como ${tokens.email}. Novas tarefas/eventos vão para o Google.`
-          : 'Google conectado. Novas tarefas/eventos serão sincronizados.',
+          ? `Conectado como ${tokens.email}. Novas tarefas/eventos vão para o Google.${sessionHint}`
+          : `Google conectado. Novas tarefas/eventos serão sincronizados.${sessionHint}`,
       };
     }
     // DEVELOPER_ERROR / misconfig: fall through to browser OAuth (agendai://).
@@ -378,30 +384,73 @@ async function refreshAccessToken(
   const webClientId = await resolveWebClientId();
   if (!tokens.refreshToken || !webClientId) return null;
 
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: webClientId,
-      grant_type: 'refresh_token',
-      refresh_token: tokens.refreshToken,
-    }).toString(),
-  });
-  if (!res.ok) return null;
-  const data = (await res.json()) as {
-    access_token?: string;
-    expires_in?: number;
-  };
-  if (!data.access_token) return null;
-  const next: GoogleTokens = {
-    ...tokens,
-    accessToken: data.access_token,
-    expiresAt: data.expires_in
-      ? Date.now() + data.expires_in * 1000
-      : undefined,
-  };
-  await saveGoogleTokens(next);
-  return next;
+  try {
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: webClientId,
+        grant_type: 'refresh_token',
+        refresh_token: tokens.refreshToken,
+      }).toString(),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      access_token?: string;
+      expires_in?: number;
+      refresh_token?: string;
+    };
+    if (!data.access_token) return null;
+    const next: GoogleTokens = {
+      ...tokens,
+      accessToken: data.access_token,
+      // Google só manda refresh_token de novo às vezes — nunca descarte o antigo.
+      refreshToken: data.refresh_token ?? tokens.refreshToken,
+      expiresAt: data.expires_in
+        ? Date.now() + data.expires_in * 1000
+        : Date.now() + 55 * 60 * 1000,
+    };
+    await saveGoogleTokens(next);
+    return next;
+  } catch {
+    return null;
+  }
+}
+
+/** Uma renovação por vez (várias APIs chamam ao mesmo tempo). */
+let refreshInFlight: Promise<GoogleTokens | null> | null = null;
+
+async function forceRefreshTokens(
+  tokens: GoogleTokens,
+): Promise<GoogleTokens | null> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    try {
+      if (tokens.refreshToken) {
+        const refreshed = await refreshAccessToken(tokens);
+        if (refreshed?.accessToken) return refreshed;
+      }
+
+      const webClientId = await resolveWebClientId();
+      if (webClientId && canUseNativeGoogleSignIn()) {
+        const silent = await nativeSilentRefreshAccessToken(webClientId);
+        if (silent?.accessToken) {
+          const next: GoogleTokens = {
+            ...tokens,
+            accessToken: silent.accessToken,
+            expiresAt:
+              silent.expiresAt ?? Date.now() + 55 * 60 * 1000,
+          };
+          await saveGoogleTokens(next);
+          return next;
+        }
+      }
+      return null;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
 }
 
 async function getValidAccessToken(): Promise<string | null> {
@@ -413,35 +462,63 @@ async function getValidAccessToken(): Promise<string | null> {
 
   if (!expired) return tokens.accessToken;
 
-  // 1) Preferência: refresh_token OAuth (fica meses/anos até revogar)
-  if (tokens.refreshToken) {
-    const refreshed = await refreshAccessToken(tokens);
-    if (refreshed?.accessToken) return refreshed.accessToken;
-  }
-
-  // 2) Fallback nativo: renova sem tela de login
-  const webClientId = await resolveWebClientId();
-  if (webClientId && canUseNativeGoogleSignIn()) {
-    const silent = await nativeSilentRefreshAccessToken(webClientId);
-    if (silent?.accessToken) {
-      const next: GoogleTokens = {
-        ...tokens,
-        accessToken: silent.accessToken,
-        expiresAt: silent.expiresAt,
-      };
-      await saveGoogleTokens(next);
-      return next.accessToken;
-    }
-  }
-
-  // Sem refresh possível: access antigo ainda pode falhar com 401
-  return tokens.accessToken;
+  const refreshed = await forceRefreshTokens(tokens);
+  // Não devolve token velho: evita cascata de 401 “sessão expirou”.
+  return refreshed?.accessToken ?? null;
 }
 
-async function ensureTaskListId(accessToken: string): Promise<string> {
-  const listRes = await fetch(
+/**
+ * Renova o access token proativamente (abertura do app / sync diária).
+ * Retorna true se há sessão utilizável.
+ */
+export async function ensureGoogleSessionFresh(): Promise<boolean> {
+  const tokens = await loadGoogleTokens();
+  if (!tokens?.accessToken) return false;
+  const token = await getValidAccessToken();
+  return Boolean(token);
+}
+
+/**
+ * fetch com Authorization e 1 retry automático após renovar o token.
+ */
+async function googleAuthorizedFetch(
+  url: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const accessToken = await getValidAccessToken();
+  if (!accessToken) {
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: 'Google não conectado.',
+          status: 'UNAUTHENTICATED',
+        },
+      }),
+      { status: 401, headers: { 'Content-Type': 'application/json' } },
+    );
+  }
+
+  const withAuth = (token: string): RequestInit => ({
+    ...init,
+    headers: {
+      ...(init.headers as Record<string, string> | undefined),
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  let res = await fetch(url, withAuth(accessToken));
+  if (res.status !== 401) return res;
+
+  const tokens = await loadGoogleTokens();
+  if (!tokens) return res;
+  const refreshed = await forceRefreshTokens(tokens);
+  if (!refreshed?.accessToken) return res;
+  return fetch(url, withAuth(refreshed.accessToken));
+}
+
+async function ensureTaskListId(): Promise<string> {
+  const listRes = await googleAuthorizedFetch(
     'https://tasks.googleapis.com/tasks/v1/users/@me/lists',
-    { headers: { Authorization: `Bearer ${accessToken}` } },
   );
   if (!listRes.ok) {
     const err = await listRes.text();
@@ -456,12 +533,11 @@ async function ensureTaskListId(accessToken: string): Promise<string> {
     data.items?.find((l) => l.title === 'AgendAI') ?? data.items?.[0];
   if (preferred?.id) return preferred.id;
 
-  const create = await fetch(
+  const create = await googleAuthorizedFetch(
     'https://tasks.googleapis.com/tasks/v1/users/@me/lists',
     {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ title: 'AgendAI' }),
@@ -489,7 +565,7 @@ export async function pushTaskToGoogle(
         message: 'Google não conectado. A tarefa ficou só no aparelho.',
       };
     }
-    const listId = await ensureTaskListId(accessToken);
+    const listId = await ensureTaskListId();
     const notes = [task.category ? `Categoria: ${task.category}` : '', task.notes ?? '']
       .filter(Boolean)
       .join('\n');
@@ -503,12 +579,11 @@ export async function pushTaskToGoogle(
       body.due = toGoogleTaskDue(task.dueAt);
     }
 
-    const res = await fetch(
+    const res = await googleAuthorizedFetch(
       `https://tasks.googleapis.com/tasks/v1/lists/${listId}/tasks`,
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
@@ -542,30 +617,32 @@ export async function completeTaskOnGoogle(
     return { ok: false, message: 'Tarefa sem id remoto no Google.' };
   }
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return { ok: false, message: 'Google não conectado.' };
     }
-    const listId = await ensureTaskListId(accessToken);
+    const listId = await ensureTaskListId();
     const body: Record<string, unknown> = {
       status: task.done ? 'completed' : 'needsAction',
     };
     if (task.done) {
       body.completed = task.completedAt ?? new Date().toISOString();
     }
-    const res = await fetch(
+    const res = await googleAuthorizedFetch(
       `https://tasks.googleapis.com/tasks/v1/lists/${listId}/tasks/${task.googleTaskId}`,
       {
         method: 'PATCH',
         headers: {
-          Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
       },
     );
     if (!res.ok) {
-      return { ok: false, message: `Google Tasks PATCH HTTP ${res.status}` };
+      const err = await res.text();
+      return {
+        ok: false,
+        message: formatGoogleHttpError('Google Tasks', res.status, err),
+      };
     }
     return { ok: true, message: 'Status atualizado no Google Tasks.' };
   } catch (e) {
@@ -583,11 +660,10 @@ export async function updateTaskOnGoogle(
     return { ok: false, message: 'Tarefa sem id remoto no Google.' };
   }
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return { ok: false, message: 'Google não conectado.' };
     }
-    const listId = await ensureTaskListId(accessToken);
+    const listId = await ensureTaskListId();
     const notes = [task.category ? `Categoria: ${task.category}` : '', task.notes ?? '']
       .filter(Boolean)
       .join('\n');
@@ -601,12 +677,11 @@ export async function updateTaskOnGoogle(
     } else {
       body.due = null;
     }
-    const res = await fetch(
+    const res = await googleAuthorizedFetch(
       `https://tasks.googleapis.com/tasks/v1/lists/${listId}/tasks/${task.googleTaskId}`,
       {
         method: 'PATCH',
         headers: {
-          Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
@@ -645,17 +720,14 @@ export async function fetchGoogleTaskStatuses(): Promise<
   | { ok: false; message: string }
 > {
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return { ok: false, message: 'Google não conectado.' };
     }
-    const listId = await ensureTaskListId(accessToken);
+    const listId = await ensureTaskListId();
     const url =
       `https://tasks.googleapis.com/tasks/v1/lists/${listId}/tasks` +
       `?showCompleted=true&showHidden=true&maxResults=100`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    const res = await googleAuthorizedFetch(url);
     if (!res.ok) {
       const err = await res.text();
       return {
@@ -741,8 +813,7 @@ export async function pushEventToGoogle(
   event: CalendarEventItem,
 ): Promise<GoogleSyncResult> {
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return {
         ok: false,
         message: 'Google não conectado. O evento ficou só no aparelho.',
@@ -804,55 +875,16 @@ export async function pushEventToGoogle(
       };
     }
 
-    const res = await fetch(
+    const res = await googleAuthorizedFetch(
       'https://www.googleapis.com/calendar/v3/calendars/primary/events',
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
       },
     );
-    if (res.status === 401) {
-      const tokens = await loadGoogleTokens();
-      if (tokens?.refreshToken) {
-        const refreshed = await refreshAccessToken(tokens);
-        if (refreshed?.accessToken) {
-          const retry = await fetch(
-            'https://www.googleapis.com/calendar/v3/calendars/primary/events',
-            {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${refreshed.accessToken}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify(body),
-            },
-          );
-          if (!retry.ok) {
-            const err = await retry.text();
-            return {
-              ok: false,
-              message: formatGoogleHttpError(
-                'Google Calendar',
-                retry.status,
-                err,
-              ),
-            };
-          }
-          const data = (await retry.json()) as { id?: string };
-          return {
-            ok: true,
-            message: event.wantsReminder
-              ? `Evento no Calendar com lembrete ${reminderMinutes} min antes.`
-              : 'Evento enviado à Agenda Google.',
-            remoteId: data.id,
-          };
-        }
-      }
-    }
     if (!res.ok) {
       const err = await res.text();
       return {
@@ -883,17 +915,13 @@ export async function deleteTaskOnGoogle(
     return { ok: true, message: 'Tarefa só local.' };
   }
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return { ok: false, message: 'Google não conectado.' };
     }
-    const listId = await ensureTaskListId(accessToken);
-    const res = await fetch(
+    const listId = await ensureTaskListId();
+    const res = await googleAuthorizedFetch(
       `https://tasks.googleapis.com/tasks/v1/lists/${listId}/tasks/${task.googleTaskId}`,
-      {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${accessToken}` },
-      },
+      { method: 'DELETE' },
     );
     if (!res.ok && res.status !== 204) {
       const err = await res.text();
@@ -918,8 +946,7 @@ export async function updateEventOnGoogle(
     return { ok: false, message: 'Evento sem id no Google.' };
   }
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return { ok: false, message: 'Google não conectado.' };
     }
     const timeZone = 'America/Sao_Paulo';
@@ -951,12 +978,11 @@ export async function updateEventOnGoogle(
         overrides: [{ method: 'popup', minutes: reminderMinutes }],
       };
     }
-    const res = await fetch(
+    const res = await googleAuthorizedFetch(
       `https://www.googleapis.com/calendar/v3/calendars/primary/events/${event.googleEventId}`,
       {
         method: 'PATCH',
         headers: {
-          Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
@@ -985,16 +1011,12 @@ export async function deleteEventOnGoogle(
     return { ok: true, message: 'Evento só local.' };
   }
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return { ok: false, message: 'Google não conectado.' };
     }
-    const res = await fetch(
+    const res = await googleAuthorizedFetch(
       `https://www.googleapis.com/calendar/v3/calendars/primary/events/${event.googleEventId}`,
-      {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${accessToken}` },
-      },
+      { method: 'DELETE' },
     );
     if (!res.ok && res.status !== 204) {
       const err = await res.text();
@@ -1103,8 +1125,7 @@ export async function fetchGoogleCalendarEvents(): Promise<
   | { ok: false; message: string }
 > {
   try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    if (!(await getValidAccessToken())) {
       return { ok: false, message: 'Google não conectado.' };
     }
     const windowStartMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
@@ -1118,9 +1139,8 @@ export async function fetchGoogleCalendarEvents(): Promise<
       orderBy: 'startTime',
       maxResults: '100',
     });
-    const res = await fetch(
+    const res = await googleAuthorizedFetch(
       `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
-      { headers: { Authorization: `Bearer ${accessToken}` } },
     );
     if (!res.ok) {
       const err = await res.text();
@@ -1326,7 +1346,7 @@ function formatGoogleHttpError(
   }
 
   if (status === 401) {
-    return `${service}: sessão Google expirou. Em Ajustes, Desconectar e Continuar com o Google de novo.`;
+    return `${service}: não foi possível renovar a sessão Google. Em Ajustes, Desconectar e Continuar com o Google de novo.`;
   }
 
   if (status === 403) {

@@ -168,8 +168,10 @@ export async function nativeSilentRefreshAccessToken(
     const mod = require('@react-native-google-signin/google-signin') as {
       GoogleSignin: {
         configure: (opts: Record<string, unknown>) => void;
+        hasPreviousSignIn?: () => boolean;
         signInSilently: () => Promise<{ type: string }>;
         getTokens: () => Promise<{ accessToken: string }>;
+        clearCachedAccessToken?: (token: string) => Promise<null>;
       };
       isSuccessResponse: (r: { type: string }) => boolean;
     };
@@ -180,13 +182,33 @@ export async function nativeSilentRefreshAccessToken(
       forceCodeForRefreshToken: true,
       scopes: SCOPES,
     });
+
+    if (
+      typeof GoogleSignin.hasPreviousSignIn === 'function' &&
+      !GoogleSignin.hasPreviousSignIn()
+    ) {
+      return null;
+    }
+
     const silent = await GoogleSignin.signInSilently();
     if (!isSuccessResponse(silent)) return null;
-    const tokens = await GoogleSignin.getTokens();
+
+    let tokens = await GoogleSignin.getTokens();
+    // Descarta cache velho e pede access token novo ao Google.
+    if (
+      tokens.accessToken &&
+      typeof GoogleSignin.clearCachedAccessToken === 'function'
+    ) {
+      try {
+        await GoogleSignin.clearCachedAccessToken(tokens.accessToken);
+        tokens = await GoogleSignin.getTokens();
+      } catch {
+        // mantém o token obtido
+      }
+    }
     if (!tokens.accessToken) return null;
     return {
       accessToken: tokens.accessToken,
-      // Google não devolve expires_in aqui; assume ~55 min
       expiresAt: Date.now() + 55 * 60 * 1000,
     };
   } catch {

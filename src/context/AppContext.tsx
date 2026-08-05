@@ -12,6 +12,7 @@ import { parseUserIntent } from '../services/ai';
 import {
   completeTaskOnGoogle,
   deleteTaskOnGoogle,
+  ensureGoogleSessionFresh,
   fetchGoogleCalendarEvents,
   fetchGoogleTaskStatuses,
   findMatchingRemoteEvent,
@@ -40,12 +41,15 @@ import {
   loadHistory,
   loadInputQueue,
   loadDismissedGoogleEventIds,
+  loadLastGoogleDailySyncAt,
   loadSettings,
   loadTodos,
+  isGoogleDailySyncDue,
   saveEvents,
   saveHistory,
   saveInputQueue,
   saveDismissedGoogleEventIds,
+  saveLastGoogleDailySyncAt,
   saveSettings,
   saveTodos,
 } from '../services/storage';
@@ -553,15 +557,57 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
   syncAgendaWithGoogleRef.current = syncAgendaWithGoogle;
 
+  const runDailyGoogleSyncIfDue = useCallback(
+    async (opts?: { force?: boolean }) => {
+      const tokens = await loadGoogleTokens();
+      if (!tokens?.accessToken) return;
+
+      if (!opts?.force) {
+        const last = await loadLastGoogleDailySyncAt();
+        if (!isGoogleDailySyncDue(last)) return;
+      }
+
+      const sessionOk = await ensureGoogleSessionFresh();
+      if (!sessionOk) {
+        setSettings((prev) => {
+          if (!prev.googleConnected) return prev;
+          const next = { ...prev, googleConnected: false };
+          void saveSettings(next);
+          return next;
+        });
+        if (opts?.force) {
+          setLastSyncNote(
+            'Não foi possível renovar a sessão Google. Em Ajustes, Desconectar e Continuar com o Google de novo.',
+          );
+        }
+        return;
+      }
+
+      setSettings((prev) => {
+        if (prev.googleConnected) return prev;
+        const next = { ...prev, googleConnected: true };
+        void saveSettings(next);
+        return next;
+      });
+
+      await syncTasksFromGoogle();
+      await syncAgendaWithGoogle({ quiet: true });
+      await saveLastGoogleDailySyncAt(Date.now());
+    },
+    [syncTasksFromGoogle, syncAgendaWithGoogle],
+  );
+
   const syncingRef = useRef(false);
+  const runDailyGoogleSyncIfDueRef = useRef(runDailyGoogleSyncIfDue);
+  runDailyGoogleSyncIfDueRef.current = runDailyGoogleSyncIfDue;
+
   useEffect(() => {
     const onAppState = (state: AppStateStatus) => {
       if (state !== 'active' || syncingRef.current) return;
       syncingRef.current = true;
       void (async () => {
         try {
-          await syncTasksFromGoogle();
-          await syncEventsFromGoogle();
+          await runDailyGoogleSyncIfDueRef.current();
         } finally {
           syncingRef.current = false;
         }
@@ -569,7 +615,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
     const sub = AppState.addEventListener('change', onAppState);
     return () => sub.remove();
-  }, [syncTasksFromGoogle, syncEventsFromGoogle]);
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -612,11 +658,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         })();
       }
       if (tokens?.accessToken) {
-        void syncTasksFromGoogle();
-        void syncEventsFromGoogle();
+        void runDailyGoogleSyncIfDueRef.current();
       }
     })();
-  }, [syncTasksFromGoogle, syncEventsFromGoogle]);
+  }, []);
 
   const persistHistory = useCallback(async (entry: HistoryEntry) => {
     setHistory((prev) => {
@@ -1540,7 +1585,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       refreshGoogleStatus,
       syncTasksFromGoogle,
       syncEventsFromGoogle,
-      syncAgendaWithGoogle: () => syncAgendaWithGoogle(),
+      syncAgendaWithGoogle: async () => {
+        const sessionOk = await ensureGoogleSessionFresh();
+        if (!sessionOk) {
+          setLastSyncNote(
+            'Não foi possível renovar a sessão Google. Em Ajustes, Desconectar e Continuar com o Google de novo.',
+          );
+          return;
+        }
+        await syncAgendaWithGoogle();
+        await saveLastGoogleDailySyncAt(Date.now());
+      },
       undoSnapshot,
       undoLastChange,
       shareOpenTasks,

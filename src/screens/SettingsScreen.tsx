@@ -528,6 +528,10 @@ export function SettingsScreen() {
                     {googleBusy ? 'Sincronizando…' : 'Sincronizar agenda'}
                   </Text>
                 </Pressable>
+                <Text style={styles.hint}>
+                  O app também sincroniza sozinho 1 vez por dia ao abrir. Se
+                  pedir login de novo, use Desconectar e Continuar com o Google.
+                </Text>
                 <Pressable
                   style={styles.btnSecondary}
                   onPress={onGoogleDisconnect}
