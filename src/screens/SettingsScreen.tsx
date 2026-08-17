@@ -529,8 +529,10 @@ export function SettingsScreen() {
                   </Text>
                 </Pressable>
                 <Text style={styles.hint}>
-                  O app também sincroniza sozinho 1 vez por dia ao abrir. Se
-                  pedir login de novo, use Desconectar e Continuar com o Google.
+                  O app sincroniza sozinho 1 vez por dia ao abrir. Se a sessão
+                  cair, Desconecte e Continuar com o Google — aceite todas as
+                  permissões (pode abrir o navegador uma vez para sessão
+                  estável).
                 </Text>
                 <Pressable
                   style={styles.btnSecondary}

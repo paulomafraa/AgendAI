@@ -19,23 +19,9 @@ try {
   BackgroundService = null;
 }
 
-const sleep = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-/**
- * Mantém o JS ativo no Android com foreground service + notificação,
- * enquanto a fila de pedidos é processada (mesmo se o usuário trocar de app).
- * Precisa ser iniciado ainda em primeiro plano (restrição do Android 12+).
- */
-export async function startQueueKeepAlive(remainingHint?: number): Promise<boolean> {
-  if (Platform.OS !== 'android' || !BackgroundService) return false;
-  if (BackgroundService.isRunning()) {
-    await updateQueueKeepAliveNotification(remainingHint);
-    return true;
-  }
-
+function buildOptions(remainingHint?: number) {
   const left = remainingHint && remainingHint > 0 ? remainingHint : 1;
-  const options = {
+  return {
     taskName: 'AgendAIFila',
     taskTitle: 'AgendAI processando',
     taskDesc:
@@ -52,18 +38,52 @@ export async function startQueueKeepAlive(remainingHint?: number): Promise<boole
       delay: 1000,
     },
   };
+}
+
+/**
+ * Executa o trabalho da fila DENTRO do foreground service.
+ * Assim o JS continua mesmo com o app fora da tela (Android).
+ * Precisa ser chamado ainda em primeiro plano (restrição Android 12+).
+ */
+export async function runWithQueueKeepAlive(
+  remainingHint: number,
+  work: () => Promise<void>,
+): Promise<void> {
+  if (Platform.OS !== 'android' || !BackgroundService) {
+    await work();
+    return;
+  }
+
+  // Já há um serviço: só roda o trabalho (mesmo bridge JS).
+  if (BackgroundService.isRunning()) {
+    await work();
+    return;
+  }
+
+  let workError: unknown;
+  try {
+    await BackgroundService.start(async () => {
+      try {
+        await work();
+      } catch (e) {
+        workError = e;
+      }
+    }, buildOptions(remainingHint));
+  } catch {
+    // Se o FGS falhar ao iniciar, ainda tenta processar em foreground.
+    await work();
+    return;
+  }
 
   try {
-    await BackgroundService.start(async (taskData) => {
-      const delay = taskData?.delay ?? 1000;
-      while (BackgroundService?.isRunning()) {
-        await sleep(delay);
-      }
-    }, options);
-    return true;
+    if (BackgroundService.isRunning()) {
+      await BackgroundService.stop();
+    }
   } catch {
-    return false;
+    // ignore
   }
+
+  if (workError) throw workError;
 }
 
 export async function updateQueueKeepAliveNotification(

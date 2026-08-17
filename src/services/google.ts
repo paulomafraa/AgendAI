@@ -1,6 +1,7 @@
 import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
 import * as SecureStore from 'expo-secure-store';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import { EMBEDDED_GOOGLE_WEB_CLIENT_ID } from '../config/googleOAuth';
 import { toGoogleRecurrence, toDateOnlySaoPaulo, toGoogleTaskDue } from './ai/shared';
@@ -20,6 +21,8 @@ import type {
 WebBrowser.maybeCompleteAuthSession();
 
 const TOKEN_KEY = 'agendai_google_tokens';
+/** Backup: SecureStore falha em alguns aparelhos e a sessão “some”. */
+const TOKEN_BACKUP_KEY = '@agendai/google_tokens_backup';
 const CLIENT_ID_OVERRIDE_KEY = 'agendai_google_web_client_id';
 const TASKS_SCOPE = 'https://www.googleapis.com/auth/tasks';
 const CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
@@ -92,8 +95,26 @@ export async function saveGoogleClientIdOverride(
 export async function loadGoogleTokens(): Promise<GoogleTokens | null> {
   try {
     const raw = await SecureStore.getItemAsync(TOKEN_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw) as GoogleTokens;
+    if (raw) {
+      const parsed = JSON.parse(raw) as GoogleTokens;
+      // Garante backup alinhado
+      void AsyncStorage.setItem(TOKEN_BACKUP_KEY, raw);
+      return parsed;
+    }
+  } catch {
+    // tenta backup
+  }
+  try {
+    const backup = await AsyncStorage.getItem(TOKEN_BACKUP_KEY);
+    if (!backup) return null;
+    const parsed = JSON.parse(backup) as GoogleTokens;
+    // Restaura no SecureStore se possível
+    try {
+      await SecureStore.setItemAsync(TOKEN_KEY, backup);
+    } catch {
+      // ignore
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -101,10 +122,35 @@ export async function loadGoogleTokens(): Promise<GoogleTokens | null> {
 
 async function saveGoogleTokens(tokens: GoogleTokens | null): Promise<void> {
   if (!tokens) {
-    await SecureStore.deleteItemAsync(TOKEN_KEY);
+    try {
+      await SecureStore.deleteItemAsync(TOKEN_KEY);
+    } catch {
+      // ignore
+    }
+    try {
+      await AsyncStorage.removeItem(TOKEN_BACKUP_KEY);
+    } catch {
+      // ignore
+    }
     return;
   }
-  await SecureStore.setItemAsync(TOKEN_KEY, JSON.stringify(tokens));
+  const raw = JSON.stringify(tokens);
+  try {
+    await SecureStore.setItemAsync(TOKEN_KEY, raw);
+  } catch {
+    // SecureStore pode falhar; backup ainda salva
+  }
+  try {
+    await AsyncStorage.setItem(TOKEN_BACKUP_KEY, raw);
+  } catch {
+    // ignore
+  }
+}
+
+/** Há refresh_token? Sem ele a sessão cai ~1h. */
+export async function hasGoogleRefreshToken(): Promise<boolean> {
+  const tokens = await loadGoogleTokens();
+  return Boolean(tokens?.refreshToken);
 }
 
 async function fetchEmail(accessToken: string): Promise<string | undefined> {
@@ -294,22 +340,25 @@ export async function connectGoogleAccount(): Promise<GoogleConnectResult> {
       }
       await saveGoogleTokens(tokens);
       pendingGoogleAuth = null;
-      const sessionHint = tokens.refreshToken
-        ? ''
-        : ' Se pedir login de novo em breve, Desconecte e conecte outra vez (aceite todas as permissões).';
-      return {
-        ok: true,
-        message: tokens.email
-          ? `Conectado como ${tokens.email}. Novas tarefas/eventos vão para o Google.${sessionHint}`
-          : `Google conectado. Novas tarefas/eventos serão sincronizados.${sessionHint}`,
-      };
-    }
-    // DEVELOPER_ERROR / misconfig: fall through to browser OAuth (agendai://).
-    // Cancelamento do utilizador não deve abrir o browser.
-    const cancelled =
-      native.error.includes('cancelado') || native.error.includes('em andamento');
-    if (cancelled) {
-      return { ok: false, message: native.error };
+
+      // Com refresh_token a sessão dura meses. Sem ele, cai ~1h — pede consent offline.
+      if (tokens.refreshToken) {
+        return {
+          ok: true,
+          message: tokens.email
+            ? `Conectado como ${tokens.email}. Sessão estável (renova sozinha).`
+            : 'Google conectado. Sessão estável (renova sozinha).',
+        };
+      }
+      // Continua no fluxo browser para obter refresh_token (prompt=consent).
+    } else {
+      const cancelled =
+        native.error.includes('cancelado') ||
+        native.error.includes('em andamento');
+      if (cancelled) {
+        return { ok: false, message: native.error };
+      }
+      // DEVELOPER_ERROR / misconfig: fall through to browser OAuth.
     }
   }
 
@@ -394,7 +443,10 @@ async function refreshAccessToken(
         refresh_token: tokens.refreshToken,
       }).toString(),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // invalid_grant = usuário revogou ou refresh morto — não apaga aqui
+      return null;
+    }
     const data = (await res.json()) as {
       access_token?: string;
       expires_in?: number;
@@ -404,7 +456,6 @@ async function refreshAccessToken(
     const next: GoogleTokens = {
       ...tokens,
       accessToken: data.access_token,
-      // Google só manda refresh_token de novo às vezes — nunca descarte o antigo.
       refreshToken: data.refresh_token ?? tokens.refreshToken,
       expiresAt: data.expires_in
         ? Date.now() + data.expires_in * 1000
@@ -426,6 +477,7 @@ async function forceRefreshTokens(
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
     try {
+      // Sempre tenta silent nativo também (mesmo com refresh), se refresh falhar.
       if (tokens.refreshToken) {
         const refreshed = await refreshAccessToken(tokens);
         if (refreshed?.accessToken) return refreshed;
@@ -457,25 +509,39 @@ async function getValidAccessToken(): Promise<string | null> {
   let tokens = await loadGoogleTokens();
   if (!tokens?.accessToken) return null;
 
+  const now = Date.now();
   const expired =
-    !tokens.expiresAt || Date.now() > tokens.expiresAt - 60_000;
+    tokens.expiresAt != null && now > tokens.expiresAt - 60_000;
+
+  // Sem expiresAt: tenta renovar em background, mas não invalida o access atual.
+  if (!tokens.expiresAt) {
+    void forceRefreshTokens(tokens);
+    return tokens.accessToken;
+  }
 
   if (!expired) return tokens.accessToken;
 
   const refreshed = await forceRefreshTokens(tokens);
-  // Não devolve token velho: evita cascata de 401 “sessão expirou”.
-  return refreshed?.accessToken ?? null;
+  if (refreshed?.accessToken) return refreshed.accessToken;
+
+  // Refresh falhou: ainda usa o access se não estiver morto há muito tempo
+  // (evita “desconectar” o usuário por falha de rede momentânea).
+  if (now < tokens.expiresAt + 6 * 60 * 60 * 1000) {
+    return tokens.accessToken;
+  }
+  return null;
 }
 
 /**
  * Renova o access token proativamente (abertura do app / sync diária).
- * Retorna true se há sessão utilizável.
+ * Retorna true se há tokens salvos (não marca desconectado por falha transitória).
  */
 export async function ensureGoogleSessionFresh(): Promise<boolean> {
   const tokens = await loadGoogleTokens();
   if (!tokens?.accessToken) return false;
-  const token = await getValidAccessToken();
-  return Boolean(token);
+  await forceRefreshTokens(tokens);
+  const again = await loadGoogleTokens();
+  return Boolean(again?.accessToken);
 }
 
 /**

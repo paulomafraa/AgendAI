@@ -59,10 +59,9 @@ import {
   onAppBecameActive,
 } from '../services/network';
 import {
-  startQueueKeepAlive,
-  stopQueueKeepAlive,
   updateQueueKeepAliveNotification,
   isQueueKeepAliveRunning,
+  runWithQueueKeepAlive,
 } from '../services/queueKeepAlive';
 import { syncWidgetsFromData } from '../widgets/refresh';
 import { formatDueDatePtBr } from '../services/ai/shared';
@@ -567,17 +566,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (!isGoogleDailySyncDue(last)) return;
       }
 
-      const sessionOk = await ensureGoogleSessionFresh();
-      if (!sessionOk) {
-        setSettings((prev) => {
-          if (!prev.googleConnected) return prev;
-          const next = { ...prev, googleConnected: false };
-          void saveSettings(next);
-          return next;
-        });
+      // Renova token se der; não marca desconectado por falha transitória.
+      await ensureGoogleSessionFresh();
+      const still = await loadGoogleTokens();
+      if (!still?.accessToken) {
         if (opts?.force) {
           setLastSyncNote(
-            'Não foi possível renovar a sessão Google. Em Ajustes, Desconectar e Continuar com o Google de novo.',
+            'Google desconectado. Em Ajustes, Continuar com o Google.',
           );
         }
         return;
@@ -1143,71 +1138,74 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const drainInputQueue = useCallback(async () => {
     if (drainingQueueRef.current) return;
     if (inputQueueRef.current.length === 0) return;
-    drainingQueueRef.current = true;
-    setQueueProcessing(true);
-    // Precisa iniciar ainda em primeiro plano (Android 12+).
-    await startQueueKeepAlive(inputQueueRef.current.length);
-    try {
-      while (inputQueueRef.current.length > 0) {
-        await updateQueueKeepAliveNotification(inputQueueRef.current.length);
-        const online = await isOnline();
-        if (!online) {
+
+    const work = async () => {
+      if (drainingQueueRef.current) return;
+      drainingQueueRef.current = true;
+      setQueueProcessing(true);
+      try {
+        while (inputQueueRef.current.length > 0) {
+          await updateQueueKeepAliveNotification(inputQueueRef.current.length);
+          const online = await isOnline();
+          if (!online) {
+            setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
+            break;
+          }
+          const head = inputQueueRef.current[0];
+          if (!head) break;
+          setError(null);
+          const openTitles = todosRef.current
+            .filter((t) => !t.done)
+            .map((t) => t.title);
+          const batch = await parseUserIntent(
+            head.text,
+            settings.aiApiKey,
+            openTitles,
+          );
+          const onlyList =
+            batch.items.length > 0 &&
+            batch.items.every((i) => i.action === 'list_tasks');
+          if (settings.confirmBeforeSave && !onlyList) {
+            setPending({ batch, source: head.source });
+            setLastSyncNote('Fila pausada aguardando sua confirmação.');
+            break;
+          }
+          await applyBatch(batch, head.source);
+          if (inputQueueRef.current[0]?.id === head.id) {
+            const next = inputQueueRef.current.slice(1);
+            inputQueueRef.current = next;
+            void saveInputQueue(next);
+            setInputQueue(next);
+          }
+          const left = inputQueueRef.current.length;
+          setLastSyncNote(
+            left > 0
+              ? `Fila: processado. Restam ${left}.`
+              : 'Fila processada.',
+          );
+        }
+      } catch (e) {
+        const message =
+          e instanceof Error ? e.message : 'Falha ao processar fila.';
+        if (isLikelyNetworkError(message)) {
           setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
-          break;
+        } else {
+          if (inputQueueRef.current.length > 0) {
+            const next = inputQueueRef.current.slice(1);
+            inputQueueRef.current = next;
+            void saveInputQueue(next);
+            setInputQueue(next);
+          }
+          setError(message);
         }
-        const head = inputQueueRef.current[0];
-        if (!head) break;
-        setError(null);
-        const openTitles = todosRef.current
-          .filter((t) => !t.done)
-          .map((t) => t.title);
-        const batch = await parseUserIntent(
-          head.text,
-          settings.aiApiKey,
-          openTitles,
-        );
-        const onlyList =
-          batch.items.length > 0 &&
-          batch.items.every((i) => i.action === 'list_tasks');
-        if (settings.confirmBeforeSave && !onlyList) {
-          setPending({ batch, source: head.source });
-          setLastSyncNote('Fila pausada aguardando sua confirmação.');
-          break;
-        }
-        await applyBatch(batch, head.source);
-        if (inputQueueRef.current[0]?.id === head.id) {
-          const next = inputQueueRef.current.slice(1);
-          inputQueueRef.current = next;
-          void saveInputQueue(next);
-          setInputQueue(next);
-        }
-        const left = inputQueueRef.current.length;
-        setLastSyncNote(
-          left > 0
-            ? `Fila: processado. Restam ${left}.`
-            : 'Fila processada.',
-        );
+      } finally {
+        drainingQueueRef.current = false;
+        setQueueProcessing(false);
       }
-    } catch (e) {
-      const message =
-        e instanceof Error ? e.message : 'Falha ao processar fila.';
-      if (isLikelyNetworkError(message)) {
-        setLastSyncNote('Sem internet. Fila pausada até voltar conexão.');
-      } else {
-        // Item inválido: remove só o primeiro para destravar.
-        if (inputQueueRef.current.length > 0) {
-          const next = inputQueueRef.current.slice(1);
-          inputQueueRef.current = next;
-          void saveInputQueue(next);
-          setInputQueue(next);
-        }
-        setError(message);
-      }
-    } finally {
-      drainingQueueRef.current = false;
-      setQueueProcessing(false);
-      await stopQueueKeepAlive();
-    }
+    };
+
+    // Trabalho roda DENTRO do foreground service → continua fora da tela.
+    await runWithQueueKeepAlive(inputQueueRef.current.length, work);
   }, [applyBatch, settings.aiApiKey, settings.confirmBeforeSave]);
 
   const submitInput = useCallback(
@@ -1219,8 +1217,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       try {
         await enqueueInput(trimmed, source);
         const queuedNow = inputQueueRef.current.length;
-        // Inicia o keep-alive ainda em primeiro plano (Android 12+).
-        await startQueueKeepAlive(queuedNow);
         setLastSyncNote(
           queuedNow > 1
             ? `Pedido adicionado. Fila com ${queuedNow} itens.`
@@ -1229,6 +1225,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       } finally {
         setBusy(false);
       }
+      // Inicia ainda em 1º plano (Android 12+ exige isso para o FGS).
       void drainInputQueue();
     },
     [enqueueInput, drainInputQueue],
@@ -1237,9 +1234,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!ready) return;
     void drainInputQueue();
-    const resumeQueue = () => {
-      // Lock preso sem keep-alive (JS congelou ao sair do app) → libera.
-      if (
+    const resumeQueue = async () => {
+      // Relê do disco: o processamento em background já pode ter gravado.
+      if (!drainingQueueRef.current) {
+        const [t, e, q] = await Promise.all([
+          loadTodos(),
+          loadEvents(),
+          loadInputQueue(),
+        ]);
+        todosRef.current = t;
+        eventsRef.current = e;
+        inputQueueRef.current = q;
+        setTodos(t);
+        setEvents(e);
+        setInputQueue(q);
+        void syncWidgetsFromData(t, e);
+      } else if (
         drainingQueueRef.current &&
         !isQueueKeepAliveRunning() &&
         inputQueueRef.current.length > 0
@@ -1248,9 +1258,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
       void drainInputQueue();
     };
-    const stop = onAppBecameActive(resumeQueue);
+    const stop = onAppBecameActive(() => {
+      void resumeQueue();
+    });
     const appStateSub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') resumeQueue();
+      if (state === 'active') void resumeQueue();
     });
     const interval = setInterval(() => {
       void drainInputQueue();
@@ -1586,10 +1598,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       syncTasksFromGoogle,
       syncEventsFromGoogle,
       syncAgendaWithGoogle: async () => {
-        const sessionOk = await ensureGoogleSessionFresh();
-        if (!sessionOk) {
+        await ensureGoogleSessionFresh();
+        const tokens = await loadGoogleTokens();
+        if (!tokens?.accessToken) {
           setLastSyncNote(
-            'Não foi possível renovar a sessão Google. Em Ajustes, Desconectar e Continuar com o Google de novo.',
+            'Google desconectado. Em Ajustes, Continuar com o Google.',
           );
           return;
         }
