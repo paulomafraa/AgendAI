@@ -74,6 +74,12 @@ export async function nativeGoogleSignIn(
     });
 
     await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+    // Limpa sessão anterior para o Google voltar a emitir serverAuthCode/refresh.
+    try {
+      await GoogleSignin.signOut();
+    } catch {
+      // ignore
+    }
     const response = await GoogleSignin.signIn();
 
     if (!isSuccessResponse(response)) {
@@ -104,8 +110,7 @@ export async function nativeGoogleSignIn(
       }
     }
 
-    // Sem refresh_token o access token dura ~1h e força relogar.
-    // Ainda assim salvamos o access atual; o app tenta silent refresh depois.
+    // Sem refresh_token o access token dura ~1h; silent refresh ainda ajuda.
     const tokens = await GoogleSignin.getTokens();
     return {
       accessToken: tokens.accessToken,
@@ -228,16 +233,15 @@ async function exchangeServerAuthCode(
     }
   | { error: string }
 > {
-  const body = new URLSearchParams({
-    code,
-    client_id: webClientId,
-    grant_type: 'authorization_code',
-  });
-
+  // Server auth code do Google Sign-In Android: sem redirect_uri.
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
+    body: new URLSearchParams({
+      code,
+      client_id: webClientId,
+      grant_type: 'authorization_code',
+    }).toString(),
   });
 
   if (!res.ok) {

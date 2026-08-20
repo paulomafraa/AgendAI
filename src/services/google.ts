@@ -341,7 +341,8 @@ export async function connectGoogleAccount(): Promise<GoogleConnectResult> {
       await saveGoogleTokens(tokens);
       pendingGoogleAuth = null;
 
-      // Com refresh_token a sessão dura meses. Sem ele, cai ~1h — pede consent offline.
+      // Nunca abre o browser depois do Sign-In nativo (Google bloqueia
+      // custom scheme → Erro 400 invalid_request / "Access blocked").
       if (tokens.refreshToken) {
         return {
           ok: true,
@@ -350,19 +351,30 @@ export async function connectGoogleAccount(): Promise<GoogleConnectResult> {
             : 'Google conectado. Sessão estável (renova sozinha).',
         };
       }
-      // Continua no fluxo browser para obter refresh_token (prompt=consent).
-    } else {
-      const cancelled =
-        native.error.includes('cancelado') ||
-        native.error.includes('em andamento');
-      if (cancelled) {
-        return { ok: false, message: native.error };
-      }
-      // DEVELOPER_ERROR / misconfig: fall through to browser OAuth.
+      return {
+        ok: true,
+        message: tokens.email
+          ? `Conectado como ${tokens.email}. Se a sessão cair em ~1h, Desconecte e conecte de novo (escolha a conta certa e aceite tudo).`
+          : 'Google conectado. Se a sessão cair em ~1h, reconecte aceitando todas as permissões.',
+      };
     }
+    const cancelled =
+      native.error.includes('cancelado') ||
+      native.error.includes('em andamento');
+    if (cancelled) {
+      return { ok: false, message: native.error };
+    }
+    // Só cai no browser se o nativo estiver quebrado (Expo Go / DEVELOPER_ERROR).
   }
 
-  // Browser + PKCE (Expo Go, or native fallback when Android OAuth client missing).
+  // Browser só no Expo Go (ou se Sign-In nativo indisponível).
+  if (!isExpoGo() && canUseNativeGoogleSignIn()) {
+    return {
+      ok: false,
+      message:
+        'Google Sign-In nativo falhou. Confira o Client Android (package com.agendai.app + SHA-1) no Google Cloud e tente de novo.',
+    };
+  }
   const prepared = await prepareGoogleAuth();
   if ('error' in prepared) {
     return { ok: false, message: prepared.error };

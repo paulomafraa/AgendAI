@@ -91,6 +91,25 @@ function id(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+const GOOGLE_PUSH_TIMEOUT_MS = 20_000;
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<T | 'timeout'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 type AppContextValue = {
   ready: boolean;
   todos: TodoItem[];
@@ -704,15 +723,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           source,
           reminderSeries,
         };
-        if (shouldSync) {
-          const sync = await pushTaskToGoogle(todo);
-          if (sync.ok && sync.remoteId) {
-            todo = { ...todo, googleTaskId: sync.remoteId };
-            setLastSyncNote(sync.message);
-          } else if (!sync.ok) {
-            setLastSyncNote(sync.message);
-          }
-        }
         if (reminderSeries && settings.notificationsEnabled) {
           const ids = await scheduleTaskReminderSeries(
             todo,
@@ -725,8 +735,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             );
           }
         }
-        const nextTodos = [todo, ...currentTodos];
+        // Grava local ANTES do Google — em background o push não pode travar o registro.
+        let nextTodos = [todo, ...currentTodos];
         commitTodos(nextTodos);
+        if (shouldSync) {
+          const sync = await withTimeout(
+            pushTaskToGoogle(todo),
+            GOOGLE_PUSH_TIMEOUT_MS,
+          );
+          if (sync === 'timeout') {
+            setLastSyncNote(
+              'Salvo no app. Envio ao Google quando a conexão permitir.',
+            );
+          } else if (sync.ok && sync.remoteId) {
+            todo = { ...todo, googleTaskId: sync.remoteId };
+            nextTodos = todosRef.current.map((t) =>
+              t.id === todo.id ? todo : t,
+            );
+            commitTodos(nextTodos);
+            setLastSyncNote(sync.message);
+          } else if (!sync.ok) {
+            setLastSyncNote(sync.message);
+          }
+        }
         const dueHint = dueAt ? ` · prazo ${formatDueDatePtBr(dueAt)}` : '';
         const seriesHint = reminderSeries
           ? ` · a cada ${reminderSeries.intervalMinutes} min (${reminderSeries.fromHour}h–${reminderSeries.toHour}h)`
@@ -870,15 +901,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           createdAt,
           source,
         };
-        if (shouldSync) {
-          const sync = await pushEventToGoogle(event);
-          if (sync.ok && sync.remoteId) {
-            event = { ...event, googleEventId: sync.remoteId };
-            setLastSyncNote(sync.message);
-          } else if (!sync.ok) {
-            setLastSyncNote(sync.message);
-          }
-        }
         if (wantsReminder && settings.notificationsEnabled) {
           const notifId = await scheduleEventReminder(
             event,
@@ -893,7 +915,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             );
           }
         }
-        commitEvents([event, ...eventsRef.current]);
+        // Grava no app primeiro — push Google não pode bloquear o registro em background.
+        commitEvents([event, ...eventsRef.current.filter((e) => e.id !== event.id)]);
+        if (shouldSync) {
+          const sync = await withTimeout(
+            pushEventToGoogle(event),
+            GOOGLE_PUSH_TIMEOUT_MS,
+          );
+          if (sync === 'timeout') {
+            setLastSyncNote(
+              'Salvo no app. Envio à Agenda Google quando a conexão permitir.',
+            );
+          } else if (sync.ok && sync.remoteId) {
+            event = { ...event, googleEventId: sync.remoteId };
+            commitEvents(
+              eventsRef.current.map((e) =>
+                e.id === event.id ? event : e,
+              ),
+            );
+            setLastSyncNote(sync.message);
+          } else if (!sync.ok) {
+            setLastSyncNote(sync.message);
+          }
+        }
         const reminderHint =
           wantsReminder && reminderMinutes != null
             ? ` · lembrete ${reminderMinutes} min`

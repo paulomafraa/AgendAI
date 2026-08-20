@@ -529,10 +529,8 @@ export function SettingsScreen() {
                   </Text>
                 </Pressable>
                 <Text style={styles.hint}>
-                  O app sincroniza sozinho 1 vez por dia ao abrir. Se a sessão
-                  cair, Desconecte e Continuar com o Google — aceite todas as
-                  permissões (pode abrir o navegador uma vez para sessão
-                  estável).
+                  Use Continuar com o Google e escolha a conta certa na tela
+                  nativa (não no navegador). O app sincroniza sozinho 1x por dia.
                 </Text>
                 <Pressable
                   style={styles.btnSecondary}
