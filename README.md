@@ -1,26 +1,44 @@
 # AgendAI
 
-App de agenda e tarefas com voz e IA (Android).
+App Android de agenda e tarefas com voz e IA.
 
-Aceita **voz** ou **texto**, interpreta com **IA** (Gemini / OpenAI / Anthropic) e organiza **tarefas** + **compromissos**, com sync opcional ao **Google Calendar** e **Google Tasks**.
+![Status](https://img.shields.io/badge/status-disponivel-0f3d36?style=flat-square)
+![Expo](https://img.shields.io/badge/Expo-SDK%2054-000020?style=flat-square)
+![React Native](https://img.shields.io/badge/React%20Native-TypeScript-61DAFB?style=flat-square)
 
-Stack: **Expo SDK 54** · **React Native** · **TypeScript**.
+## Sobre
 
-## Releases
+Aceita voz ou texto, interpreta com IA (Gemini, OpenAI ou Anthropic) e organiza tarefas e compromissos.  
+Tem sync opcional com Google Calendar e Google Tasks.
 
-Baixe o APK estável nas **[Releases](https://github.com/paulomafraa/AgendAI/releases)** do GitHub.
+## Stack
 
-> No Android, pode ser necessário permitir a instalação de apps de fontes desconhecidas.
+| Item | Tecnologia |
+| --- | --- |
+| App | Expo SDK 54 · React Native · TypeScript |
+| IA | Gemini / OpenAI / Anthropic |
+| Integrações | Google Calendar · Google Tasks |
 
-## Uso rápido
+## Funcionalidades
 
-1. Instale o APK da Release  
-2. Em **Ajustes**, cole sua chave de IA (Gemini recomendado)  
-3. Fale ou digite: tarefas, compromissos, “próximo jogo do Vasco”, etc.
+- Entrada por voz ou texto
+- Interpretação com IA para criar tarefas e compromissos
+- Sync opcional com Google Calendar e Google Tasks
+- APK disponível nas Releases
 
-Google (opcional): **Continuar com o Google** em Ajustes.
+## Como usar
+
+1. Baixe o APK nas [Releases](https://github.com/paulomafraa/AgendAI/releases)
+2. No Android, permita instalação de fontes desconhecidas se pedir
+3. Em Ajustes, cole sua chave de IA (Gemini recomendado)
+4. Fale ou digite: tarefas, compromissos, lembretes, etc.
+5. Google (opcional): Continuar com o Google em Ajustes
 
 ## Licença
 
-Código e app com **todos os direitos reservados** — veja [LICENSE](LICENSE).  
-O repositório é público para transparência e distribuição do APK; **não** é open source.
+Todos os direitos reservados. Veja [LICENSE](LICENSE).  
+O repositório é público para transparência e distribuição do APK. Não é open source.
+
+## Autor
+
+[Paulo Mafra Watanabe](https://github.com/paulomafraa) · [LinkedIn](https://www.linkedin.com/in/paulo-watanabe/)
